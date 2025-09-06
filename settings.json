@@ -1,0 +1,30 @@
+{
+  "finlyt": {
+    "subscription": {
+      "id": null,
+      "location": "eastus"
+    },
+    "resource_group": {
+      "name": null
+    },
+    "Storage_account": {
+      "id": null
+    },
+    "cost_mgmt": {
+      "can_setup_exports": {
+        "eligible_for_export": true
+      },
+      "recommended_export_scope": {
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      },
+      "recommended_destination": {
+        "resource_id": null,
+        "container": "cost",
+        "root_path": "exports/focus"
+      }
+    },
+    "cm_exports": {
+      "running": []
+    }
+  }
+}

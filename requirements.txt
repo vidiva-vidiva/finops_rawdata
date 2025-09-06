@@ -1,0 +1,14 @@
+azure-identity>=1.16.0
+azure-mgmt-resource>=23.0.0
+azure-mgmt-subscription
+azure-mgmt-costmanagement>=4.0.0
+azure-mgmt-storage
+azure-mgmt-authorization
+azure-mgmt-resourcegraph
+azure-storage-blob
+requests
+python-dotenv
+PyYAML
+azure-mgmt-advisor
+azure-mgmt-billing           # if you want to enumerate billing scopes
+azure-mgmt-managementgroups  # if you want to enumerate management groups

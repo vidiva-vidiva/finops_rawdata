@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+# 02_deploy_finlythub.py
+# Deploys FinlytHub (storage + containers + UAMI) by compiling Bicep in-script,
+# computing unique names per subscription, running an incremental deployment,
+# gating on preflight checks, reading outputs, and assigning RBAC to the UAMI.
+"""
+deploy.py - Settings-aware deploy that can (optionally) Bicep-deploy FinlytHub
+and then create/update a Cost Management export at any supported scope.
+
+Scopes supported by Exports API (2025-03-01):
+  /subscriptions/{subId}
+  /subscriptions/{subId}/resourceGroups/{rg}
+  /providers/Microsoft.Management/managementGroups/{mgId}
+  /providers/Microsoft.Billing/billingAccounts/{baId}
+  /providers/Microsoft.Billing/billingAccounts/{baId}/billingProfiles/{bpId}
+  /providers/Microsoft.Billing/billingAccounts/{baId}/billingProfiles/{bpId}/invoiceSections/{isId}
+(Partners: customers/{customerId})
+Docs: https://learn.microsoft.com/rest/api/cost-management/exports/create-or-update?view=rest-cost-management-2025-03-01
+"""
+
+import os
+import sys
+import json
+import uuid
+import argparse
+import hashlib
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional
+from finlyt_common import run_cmd, compile_bicep_to_json, http_with_backoff, get_token
+
+import requests
+import subprocess
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.storage import StorageManagementClient
+from azure.storage.blob import BlobServiceClient
+
+# ---------- Constants ----------
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
+UTC = timezone.utc
+EXPORTS_API = "2025-03-01"   # Exports API version
+RETRYABLE = {429, 500, 502, 503, 504}
+
+# ---------- Infra (SDK) ----------
+def ensure_rg(cred, subscription_id: str, rg_name: str, location: str):
+    rm = ResourceManagementClient(cred, subscription_id)
+    rm.resource_groups.create_or_update(rg_name, {"location": location})
+
+def ensure_sa(cred, subscription_id: str, rg_name: str, sa_name: str, location: str, sku: str = "Standard_LRS"):
+    sm = StorageManagementClient(cred, subscription_id)
+    try:
+        sm.storage_accounts.get_properties(rg_name, sa_name)
+        return
+    except Exception:
+        pass
+    poller = sm.storage_accounts.begin_create(
+        rg_name, sa_name,
+        {"sku": {"name": sku}, "kind": "StorageV2", "location": location, "enable_https_traffic_only": True}
+    )
+    poller.result()
+
+def ensure_container(cred, sa_name: str, container: str):
+    blob = BlobServiceClient(f"https://{sa_name}.blob.core.windows.net", credential=cred)
+    cc = blob.get_container_client(container)
+    try:
+        cc.get_container_properties()
+    except Exception:
+        cc.create_container()
+
+def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_path: str,
+                               hub_name: str, mi_name: str, location: str, tags: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Uses 'az deployment group create' for simplicity to deploy the compiled template.
+    You can replace with SDK-based ARM deployment if you prefer.
+    """
+    # Ensure RG exists
+    ensure_rg(cred, subscription_id, rg_name, location)
+
+    # Compile
+    from finlyt_common import compile_bicep_to_json
+    template_json = compile_bicep_to_json(bicep_path)
+
+    # CLI group deployment (keeps parity with your current approach)
+    cmd = [
+        "az", "deployment", "group", "create",
+        "--subscription", subscription_id,
+        "--resource-group", rg_name,
+        "--template-file", template_json,
+        "--parameters",
+            f"hubName={hub_name}",
+            f"miName={mi_name}",
+            f"location={location}",
+            f"deploymentTimestamp={datetime.now(UTC).isoformat()}",
+            f"tags={json.dumps(tags)}"
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
+    if proc.returncode != 0:
+        # Provide richer diagnostics including stdout and stderr. Some az errors stream pieces to stdout.
+        combined = (proc.stderr or '')
+        if proc.stdout:
+            combined += "\n[stdout]\n" + proc.stdout
+        hint = ''
+        if 'authorizationfailed' in combined.lower():
+            hint = '\nHint: Ensure you have at least Contributor on the resource group and subscription.'
+        elif 'invalidparameter' in combined.lower():
+            hint = '\nHint: Validate parameter values (hubName uniqueness, location spelling).'
+        elif 'not found' in combined.lower() and 'resource group' in combined.lower():
+            hint = '\nHint: Resource group creation may have failed; check permissions.'
+        raise RuntimeError(f"Bicep deployment failed (exit {proc.returncode}):\n{combined}{hint}")
+
+    try:
+        body = json.loads(proc.stdout)
+    except Exception:
+        body = {}
+
+    # Parse outputs
+    outputs = (body.get("properties", {}) or {}).get("outputs", {}) or {}
+    return {
+        "resource_id": outputs.get("storageAccountId", {}).get("value") or
+                       f"/subscriptions/{subscription_id}/resourceGroups/{rg_name}/providers/Microsoft.Storage/storageAccounts/{hub_name}",
+        "storage_account_name": outputs.get("storageAccountName", {}).get("value") or hub_name,
+        "uami": {
+            "id": outputs.get("uamiId", {}).get("value"),
+            "principal_id": outputs.get("uamiPrincipalId", {}).get("value"),
+            "client_id": outputs.get("uamiClientId", {}).get("value")
+        },
+        "containers": {
+            "daily": outputs.get("dailyContainerName", {}).get("value") or "daily",
+            "monthly": outputs.get("monthlyContainerName", {}).get("value") or "monthly",
+            "reservation": outputs.get("reservationContainerName", {}).get("value") or "reservation"
+        }
+    }
+
+# ---------- Exports ----------
+def create_or_update_export(cred, scope_id: str, export_name: str, export_body: Dict[str, Any]) -> Dict[str, Any]:
+    from finlyt_common import get_token
+    token = get_token(cred)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    url = (f"https://management.azure.com/{scope_id}"
+           f"/providers/Microsoft.CostManagement/exports/{export_name}?api-version={EXPORTS_API}")
+    r = http_with_backoff(requests.put, url, headers=headers, json_body=export_body, timeout=120)
+    if r is None or r.status_code not in (200, 201):
+        raise RuntimeError(f"CreateOrUpdate failed: HTTP {getattr(r,'status_code',None)} {getattr(r,'text','')[:400]}")
+    return r.json() or {}
+
+def build_export_body(dataset: str, recurrence: str, dest_resource_id: str,
+                      container: str, root: str, fmt: str,
+                      timeframe: str = "Custom",
+                      from_date: Optional[str] = None, to_date: Optional[str] = None,
+                      compression: Optional[str] = None, overwrite: bool = False) -> Dict[str, Any]:
+    """
+    Builds request body for Exports Create/Update (2025-03-01).
+    Supports all documented timeframe enums. Only includes timePeriod when timeframe=='Custom'.
+    """
+    dtype = "FocusCost" if dataset.lower() == "focus" else dataset
+
+    # Accept both shorthand and full enum
+    tf_map = {
+        "MTD": "MonthToDate",
+        "Custom": "Custom",
+        "MonthToDate": "MonthToDate",
+        "BillingMonthToDate": "BillingMonthToDate",
+        "TheLastMonth": "TheLastMonth",
+        "TheLastBillingMonth": "TheLastBillingMonth",
+        "WeekToDate": "WeekToDate",
+        "TheCurrentMonth": "TheCurrentMonth",
+    }
+    timeframe_value = tf_map.get(timeframe, timeframe or "Custom")
+
+    props: Dict[str, Any] = {
+        "definition": {
+            "type": dtype,
+            "timeframe": timeframe_value
+        },
+        "deliveryInfo": {
+            "destination": {
+                "resourceId": dest_resource_id,
+                "container": container,
+                "rootFolderPath": root or ""
+            }
+        },
+        "schedule": {
+            "recurrence": recurrence,
+            "status": "Active",
+            "recurrencePeriod": {
+                "from": "2020-01-01T00:00:00Z",
+                "to": "2035-12-31T00:00:00Z"
+            }
+        }
+    }
+    # Only include timePeriod when using Custom
+    if timeframe_value == "Custom":
+        tp_from = from_date or datetime.now(UTC).strftime("%Y-%m-%d")
+        tp_to = to_date or datetime.now(UTC).strftime("%Y-%m-%d")
+        props["definition"]["timePeriod"] = {"from": tp_from, "to": tp_to}
+
+    # Always include format when provided (FOCUS needs it too)
+    if fmt:
+        props["format"] = fmt
+    if compression:
+        props["compressionMode"] = compression  # Gzip | Snappy
+    if overwrite:
+        props["dataOverwriteBehavior"] = "OverwritePreviousReport"
+    return {"properties": props}
+
+
+# ---------- Settings helpers ----------
+def load_settings(path: str) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return json.load(f)
+
+def suggest_defaults_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    rec_scope = ((settings.get("finlyt", {}) or {}).get("cost_mgmt", {}) or {}).get("recommended_export_scope", {})
+    rec_dest  = ((settings.get("finlyt", {}) or {}).get("cost_mgmt", {}) or {}).get("recommended_destination", {})
+    sa = (settings.get("finlyt", {}) or {}).get("Storage_account", {}) or {}
+    return {
+        "scope_id": rec_scope.get("id"),
+        "dest_resource_id": rec_dest.get("resource_id") or sa.get("id"),
+        "dest_container": rec_dest.get("container") or "cost",
+        "dest_root": rec_dest.get("root_path") or "exports/focus"
+    }
+
+ # ---------- Interactive Flow ----------
+def _strip_quotes(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1].strip()
+    return s
+
+def _prompt(msg: str, default: str | None = None) -> str:
+    try:
+        raw = input(f"{msg}{' ['+default+']' if default else ''}: ").strip()
+        val = raw or (default or '')
+        return _strip_quotes(val)
+    except EOFError:
+        return _strip_quotes(default or '')
+
+def _choose(msg: str, options: list[str], default_index: int | None = None) -> str:
+    print(msg)
+    for i, o in enumerate(options, 1):
+        print(f" {i}. {o}")
+    while True:
+        raw = _prompt("Enter choice", str(default_index+1) if default_index is not None else None)
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(options):
+                return options[idx-1]
+        except Exception:
+            pass
+        print("Invalid choice. Try again.")
+
+
+def _multiselect(msg: str, options: list[str], default_indices: list[int] | None = None) -> list[str]:
+    """
+    Console multiselect: prints numbered options and accepts comma-separated indices.
+    Returns the list of chosen option strings. Re-prompts on invalid input.
+    """
+    print(msg)
+    for i, o in enumerate(options, 1):
+        print(f" {i}. {o}")
+    default_indices = default_indices or []
+    default_str = ",".join(str(i+1) for i in default_indices) if default_indices else None
+    while True:
+        raw = _prompt("Select one or more (comma-separated)", default_str)
+        parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+        try:
+            idxs = sorted({int(p)-1 for p in parts}) if parts else (default_indices or [])
+            if not idxs:
+                raise ValueError
+            if any(i < 0 or i >= len(options) for i in idxs):
+                raise ValueError
+            return [options[i] for i in idxs]
+        except Exception:
+            print("Invalid selection. Use numbers like 1,2,3 from the list above.")
+
+def _parse_scope_id(scope_id: str) -> dict:
+     """Return {'type': <...>, pieces...} from an ARM scope id."""
+     s = (scope_id or "").strip()
+     out = {"type": None}
+     if not s:
+         return out
+     # Normalize double slashes etc.
+     parts = [p for p in s.split('/') if p]
+     try:
+         if parts[0] == 'subscriptions':
+             out["type"] = "subscription"
+             out["subscription"] = parts[1]
+             # resourceGroup path
+             if len(parts) >= 4 and parts[2] == 'resourceGroups':
+                 out["type"] = "resourceGroup"
+                 out["resourceGroup"] = parts[3]
+         elif parts[0] == 'providers' and parts[1] == 'Microsoft.Management' and parts[2] == 'managementGroups':
+             out["type"] = "managementGroup"
+             out["managementGroup"] = parts[3]
+         elif parts[0] == 'providers' and parts[1] == 'Microsoft.Billing' and parts[2] == 'billingAccounts':
+             out["billingAccount"] = parts[3]
+             if len(parts) >= 6 and parts[4] == 'billingProfiles':
+                 out["type"] = "billingProfile"
+                 out["billingProfile"] = parts[5]
+                 if len(parts) >= 8 and parts[6] == 'invoiceSections':
+                     out["type"] = "invoiceSection"
+                     out["invoiceSection"] = parts[7]
+             else:
+                 out["type"] = "billingAccount"
+     except Exception:
+         pass
+     return out
+
+def get_timeframes_for_scope(scope_id: str) -> dict:
+    """
+    Returns a dict of {Daily: <timeframe>, Monthly: <timeframe>}
+    that matches the allowed values for the given scope type.
+    """
+    parsed = _parse_scope_id(scope_id)
+    stype = parsed.get("type")
+
+    if stype in ("billingAccount", "billingProfile", "invoiceSection"):
+        return {"Daily": "MonthToDate", "Monthly": "TheLastMonth"}
+    else:
+        return {"Daily": "MonthToDate", "Monthly": "TheLastMonth"}
+
+def _parse_storage_account_id(resource_id: str) -> dict:
+     """
+     Parse a Storage Account ARM ID into {subscription, resourceGroup, name}.
+     /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Storage/storageAccounts/{name}
+     """
+     out = {}
+     if not resource_id:
+         return out
+     parts = [p for p in resource_id.split('/') if p]
+     try:
+         if parts[0] == 'subscriptions' and parts[2] == 'resourceGroups' and parts[4] == 'providers' and parts[5] == 'Microsoft.Storage' and parts[6] == 'storageAccounts':
+             out["subscription"] = parts[1]
+             out["resourceGroup"] = parts[3]
+             out["name"] = parts[7]
+     except Exception:
+         pass
+     return out
+
+def interactive_flow(cred, settings):
+    """
+    Minimal interactive: user selects SCOPE and DATASETS only.
+    Destination (RG/SA/container/export names) comes entirely from Bicep/settings.
+    """
+    # 1) Determine scope (prefer recommendation)
+    seeded = suggest_defaults_from_settings(settings)
+    rec_scope_id = (seeded or {}).get("scope_id")
+    def _scope_exists(cred, scope_id: str) -> bool:
+        token = get_token(cred)
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"https://management.azure.com/{scope_id}/providers/Microsoft.CostManagement/exports?api-version={EXPORTS_API}"
+        r = http_with_backoff(requests.get, url, headers=headers, timeout=30)
+        return r is not None and r.status_code in (200,204,401,403)
+
+    if rec_scope_id and _scope_exists(cred, rec_scope_id):
+        print("\nDetected recommended export scope from settings:")
+        print(f"  {rec_scope_id}")
+        if _prompt("Use recommended scope? (Y/n)", "Y").lower().startswith('y'):
+            scope_id = rec_scope_id
+        else:
+            scope_id = None
+    else:
+        scope_id = None
+
+    if not scope_id:
+        # guided builder for scope id with validation & recommendations
+        options = ["subscription","resourceGroup","managementGroup","billingAccount","billingProfile","invoiceSection"]
+        scope_type = _choose("\nSelect a scope to create/update cost management exports:", options, 0)
+
+        # Parse recommended scope into components for suggestion
+        rec_parsed = _parse_scope_id(rec_scope_id) if rec_scope_id else {}
+
+        import re
+
+        # Gather fallback IDs from settings
+        fallback_sub_ids = []
+        fallback_mg_ids: list[str] = []
+        fallback_ba_ids: list[str] = []
+        fallback_bp_ids: list[str] = []  # format ba/profile
+        fallback_inv_ids: list[str] = [] # format ba/profile/invoice
+        try:
+            fin_sub = (settings.get('finlyt', {}) or {}).get('subscription', {}) or {}
+            if fin_sub.get('id'):
+                fallback_sub_ids.append(fin_sub.get('id'))
+            hub = (settings.get('finlyt', {}) or {}).get('hub', {}) or {}
+            if hub.get('subscription_id') and hub.get('subscription_id') not in fallback_sub_ids:
+                fallback_sub_ids.append(hub.get('subscription_id'))
+            # Management groups (assignment summary list) if present
+            assignments = (settings.get('finlyt', {}) or {}).get('cost_mgmt', {}) or {}
+            # Pull from any structure if available later (placeholder)
+            # Billing accounts / profiles / invoice sections from settings['billing'] assignments summary
+            billing = settings.get('billing', {}) or {}
+            # For detailed fallback we inspect 'accounts' only; profiles & invoice sections aren't stored there
+            # but we have recommended scope id which may embed them.
+            if billing.get('accounts'):
+                for a in billing.get('accounts') or []:
+                    if a and a.get('id') and a.get('id') not in fallback_ba_ids:
+                        fallback_ba_ids.append(a.get('id'))
+            # Derive bp/invoice from recommended scope if present (split path segments)
+            if rec_scope_id and 'billingAccounts' in rec_scope_id:
+                parts = [p for p in rec_scope_id.split('/') if p]
+                try:
+                    ba_idx = parts.index('billingAccounts')+1 if 'billingAccounts' in parts else None
+                    if ba_idx and ba_idx < len(parts):
+                        ba_name = parts[ba_idx]
+                        if ba_name and ba_name not in fallback_ba_ids:
+                            fallback_ba_ids.append(ba_name)
+                    if 'billingProfiles' in parts:
+                        bp_idx = parts.index('billingProfiles')+1
+                        if bp_idx < len(parts):
+                            bp_name = parts[bp_idx]
+                            ba_name = fallback_ba_ids[0] if fallback_ba_ids else None
+                            if ba_name and bp_name:
+                                combo = f"{ba_name}/{bp_name}"
+                                if combo not in fallback_bp_ids:
+                                    fallback_bp_ids.append(combo)
+                    if 'invoiceSections' in parts:
+                        inv_idx = parts.index('invoiceSections')+1
+                        if inv_idx < len(parts):
+                            inv_name = parts[inv_idx]
+                            # Need ba/profile
+                            if fallback_bp_ids:
+                                prefix = fallback_bp_ids[0]
+                                full = f"{prefix}/{inv_name}"
+                                if full not in fallback_inv_ids:
+                                    fallback_inv_ids.append(full)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        def _validate_component(label: str, value: str, recommended: str | None) -> str:
+            """Validate a scope component. If invalid offer recommended or fallback list; allow one retry then abort."""
+            def _is_valid(lbl: str, val: str) -> bool:
+                if lbl.startswith('Subscription'):
+                    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", val))
+                if lbl.startswith('Resource group'):
+                    return bool(re.fullmatch(r"[-\w\._()]{1,90}", val)) and not val.endswith('.')
+                return bool(val)
+            attempt = 0
+            current = value
+            while True:
+                if _is_valid(label, current):
+                    if recommended and current != recommended:
+                        print(f"Note: using {label.lower()} '{current}' (differs from settings '{recommended}').")
+                    return current
+                attempt += 1
+                if attempt == 1:
+                    if recommended:
+                        print(f"Invalid {label.lower()} '{current}'. Recommended from settings: {recommended}")
+                        if _prompt(f"Use recommended {label.lower()}? (Y/n)", "Y").lower().startswith('y'):
+                            current = recommended
+                            continue
+                    def _select_from_list(title: str, items: list[str]) -> str | None:
+                        if not items:
+                            return None
+                        print(title)
+                        for i, v in enumerate(items, 1):
+                            print(f"  {i}. {v}")
+                        choose_local = _prompt("Select number to use or press Enter to type manually")
+                        if choose_local.isdigit():
+                            idx2 = int(choose_local)-1
+                            if 0 <= idx2 < len(items):
+                                return items[idx2]
+                        return None
+                    if label.startswith('Subscription'):
+                        sel = _select_from_list("Available subscription IDs from settings:", fallback_sub_ids)
+                        if sel:
+                            current = sel
+                            continue
+                    elif label.startswith('Management group'):
+                        sel = _select_from_list("Available management group IDs from settings:", fallback_mg_ids)
+                        if sel:
+                            current = sel
+                            continue
+                    elif label.startswith('Billing account'):
+                        sel = _select_from_list("Available billing account IDs from settings:", fallback_ba_ids)
+                        if sel:
+                            current = sel
+                            continue
+                    elif label.startswith('Billing profile'):
+                        sel = _select_from_list("Available billing profile IDs from settings (ba/profile):", fallback_bp_ids)
+                        if sel and '/' in sel:
+                            current = sel.split('/',1)[1]
+                            continue
+                    elif label.startswith('Invoice section'):
+                        sel = _select_from_list("Available invoice section IDs from settings (ba/profile/invoice):", fallback_inv_ids)
+                        if sel and sel.count('/') == 2:
+                            current = sel.rsplit('/',1)[1]
+                            continue
+                    current = _prompt(f"Re-enter {label}")
+                    continue
+                print(f"Aborting: invalid {label.lower()} entered twice.")
+                sys.exit(1)
+
+        # Build scope id based on selected type
+        if scope_type == 'subscription':
+            sub_in = _prompt('Subscription ID')
+            sub = _validate_component('Subscription ID', sub_in, rec_parsed.get('subscription'))
+            scope_id = f"/subscriptions/{sub}"
+        elif scope_type == 'resourceGroup':
+            sub_in = _prompt('Subscription ID')
+            sub = _validate_component('Subscription ID', sub_in, rec_parsed.get('subscription'))
+            rg_in = _prompt('Resource group name')
+            rg = _validate_component('Resource group name', rg_in, rec_parsed.get('resourceGroup'))
+            scope_id = f"/subscriptions/{sub}/resourceGroups/{rg}"
+        elif scope_type == 'managementGroup':
+            mg_in = _prompt('Management group ID')
+            mg = _validate_component('Management group ID', mg_in, rec_parsed.get('managementGroup'))
+            scope_id = f"/providers/Microsoft.Management/managementGroups/{mg}"
+        elif scope_type == 'billingAccount':
+            ba_in = _prompt('Billing account ID')
+            ba = _validate_component('Billing account ID', ba_in, rec_parsed.get('billingAccount'))
+            scope_id = f"/providers/Microsoft.Billing/billingAccounts/{ba}"
+        elif scope_type == 'billingProfile':
+            ba_in = _prompt('Billing account ID')
+            ba = _validate_component('Billing account ID', ba_in, rec_parsed.get('billingAccount'))
+            bp_in = _prompt('Billing profile ID')
+            bp = _validate_component('Billing profile ID', bp_in, rec_parsed.get('billingProfile'))
+            scope_id = f"/providers/Microsoft.Billing/billingAccounts/{ba}/billingProfiles/{bp}"
+        else:  # invoiceSection
+            ba_in = _prompt('Billing account ID')
+            ba = _validate_component('Billing account ID', ba_in, rec_parsed.get('billingAccount'))
+            bp_in = _prompt('Billing profile ID')
+            bp = _validate_component('Billing profile ID', bp_in, rec_parsed.get('billingProfile'))
+            inv_in= _prompt('Invoice section ID')
+            inv = _validate_component('Invoice section ID', inv_in, rec_parsed.get('invoiceSection'))
+            scope_id = f"/providers/Microsoft.Billing/billingAccounts/{ba}/billingProfiles/{bp}/invoiceSections/{inv}"
+
+    # Offer destination storage recommendation before proceeding
+    seeded_defaults = suggest_defaults_from_settings(settings)
+    rec_dest_id = (seeded_defaults or {}).get('dest_resource_id')
+    if rec_dest_id:
+        print(f"\nSelect destination Storage for {scope_id}:")
+        print(f"  Recommended: {rec_dest_id}")
+        _ = _prompt("Use recommended destination? (Y/n)", "Y")  # Currently informational; underlying logic will reuse if present
+
+    # 2) Always deploy/ensure hub via Bicep (names not user-editable)
+    finlyt = settings.get('finlyt', {}) if isinstance(settings, dict) else {}
+    dest_sub = (finlyt.get('subscription', {}) or {}).get('id')
+    dest_rg  = (finlyt.get('resource_group', {}) or {}).get('name')
+    dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
+    if not dest_sub:
+        # If scope is subscription or RG, infer sub id
+        # robust extraction: look for /subscriptions/{subId} and /resourceGroups/{rg}
+        import re
+        m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
+        if m_sub:
+            dest_sub = m_sub.group(1)
+        else:
+            # no subscription in scope - leave dest_sub as None (e.g. billing profile scope)
+            dest_sub = None
+        # also try to extract resource group (optional)
+        m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
+        if m_rg:
+            dest_rg = m_rg.group(1)
+    if not dest_rg and dest_sub:
+        dest_rg = f"rg-finlythub-{dest_sub[:8]}"
+    if not dest_sub or not dest_rg:
+        raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
+
+    suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
+    hub_name = f"finlythub{suffix}"
+    mi_name  = f"{hub_name}-mi"
+
+    # Reuse existing storage account if already detected in settings
+    existing_sa_id = (finlyt.get('Storage_account') or {}).get('id') if isinstance(finlyt, dict) else None
+    meta = None
+    if existing_sa_id:
+        parsed = _parse_storage_account_id(existing_sa_id)
+        if parsed.get('subscription') == dest_sub and parsed.get('resourceGroup') == dest_rg:
+            meta = {
+                'resource_id': existing_sa_id,
+                'storage_account_name': parsed.get('name'),
+                'uami': {},
+                'containers': {}
+            }
+            # Ensure standard containers exist
+            for c in ['daily','monthly','reservation']:
+                try:
+                    ensure_container(cred, parsed.get('name'), c)
+                except Exception:
+                    pass
+    if meta is None:
+        meta = deploy_finlythub_via_bicep(
+            cred=cred,
+            subscription_id=dest_sub,
+            rg_name=dest_rg,
+            bicep_path="./02_finlythub_deploy.bicep",
+            hub_name=hub_name,
+            mi_name=mi_name,
+            location=dest_loc,
+            tags={"Application":"FinlytHub"}
+        )
+
+    export_dest_resource_id = meta["resource_id"]
+    containers = meta.get('containers', {})
+
+    # 3) Dataset selection only (multi-select)
+    # Determine scope type to decide Reservation dataset availability
+    parsed_scope = _parse_scope_id(scope_id)
+    scope_type = parsed_scope.get('type')
+    reservation_supported = scope_type in ("billingAccount","billingProfile","invoiceSection")
+    print("\nDataset availability:")
+    print("  FOCUS, ActualCost, AmortizedCost, Usage: supported for all selected scopes")
+    if reservation_supported:
+        print("  Reservation: supported for billingAccount / billingProfile / invoiceSection scopes")
+    else:
+        print("  Reservation: NOT supported for scope type '" + str(scope_type) + "' and will be skipped if selected")
+    datasets = _multiselect(
+        "Select datasets to export:",
+        ["FOCUS","ActualCost","AmortizedCost","Usage","Reservation"],
+        default_indices=[0,1]
+    )
+    if not reservation_supported and "Reservation" in datasets:
+        datasets = [d for d in datasets if d != "Reservation"]
+        print("  -> Skipping Reservation dataset (unsupported at this scope type).")
+
+    ds_recurrences = {
+        "FOCUS": ["Daily","Monthly"],
+        "ActualCost": ["Daily","Monthly"],
+        "AmortizedCost": ["Daily","Monthly"],
+        "Usage": ["Daily","Monthly"],
+        "Reservation": ["Daily","Monthly"]
+    }
+
+    fmt_choice = _choose("Format (affects all datasets, some may override):", ["Parquet","Csv"], 0)
+    comp_default = 'Snappy' if fmt_choice=='Parquet' else 'Gzip'
+    compression = _choose("Compression:", ["None","Gzip","Snappy"], ["None","Gzip","Snappy"].index(comp_default))
+    overwrite = _prompt("Overwrite existing files for same period? (y/N)", "N").lower().startswith('y')
+
+    ds_to_container_key = {
+        'FOCUS':'daily','ActualCost':'daily','AmortizedCost':'daily','Usage':'daily','Reservation':'reservation'}
+    default_roots = {
+        'FOCUS':'exports/focus','ActualCost':'exports/actual','AmortizedCost':'exports/amortized','Usage':'exports/usage','Reservation':'exports/reservation'}
+
+    # Scope-aware timeframe mapping
+    tf_map = get_timeframes_for_scope(scope_id)
+
+    dataset_api_type = {
+        'FOCUS': 'FocusCost',
+        'ActualCost': 'ActualCost',
+        'AmortizedCost': 'AmortizedCost',
+        'Usage': 'Usage',
+        # Reservation only used if reservation_supported and selected
+        'Reservation': 'ReservationDetails',
+    }
+
+    print("\nExport deployment plan:")
+    print(f" Scope: {scope_id}")
+    print(f" Destination: {export_dest_resource_id}")
+    for ds in datasets:
+        recs = ds_recurrences.get(ds, ['Daily'])
+        print(f"  - {ds}: {', '.join([r + ' (' + tf_map[r] + ')' for r in recs])}")
+
+    _ = _prompt('Press Enter to continue', '')
+
+    for ds in datasets:
+        container_name = containers.get(ds_to_container_key.get(ds,'daily'), 'daily')
+        try:
+            ensure_container(cred, meta['storage_account_name'], container_name)
+        except Exception:
+            pass
+        # Decide per-dataset format/capabilities
+        export_type = dataset_api_type.get(ds, ds)
+        fmt = fmt_choice
+        if export_type in ("ReservationDetails","ReservationRecommendations","ReservationTransactions"):
+            # Reservations: CSV only and NO compression (data version rejects Gzip for Csv)
+            fmt = "Csv"
+            effective_compression = None
+        else:
+            # Ensure compression matches the format (Gzip↔Csv, Snappy↔Parquet)
+            if fmt == "Csv" and compression == "Snappy":
+                effective_compression = "Gzip"
+            elif fmt == "Parquet" and compression == "Gzip":
+                effective_compression = "Snappy"
+            else:
+                effective_compression = (None if compression == "None" else compression)
+        for recurrence in ds_recurrences.get(ds, ['Daily']):
+            timeframe = tf_map[recurrence]
+            name = f"finlyt_{ds.lower()}_{recurrence.lower()}"
+            body = build_export_body(
+                dataset=export_type, recurrence=recurrence,
+                dest_resource_id=export_dest_resource_id,
+                container=container_name, root=default_roots.get(ds,'exports'),
+                fmt=fmt, timeframe=timeframe,
+                compression=effective_compression,
+                overwrite=overwrite
+            )
+            try:
+                result = create_or_update_export(cred, scope_id, name, body)
+                print(f" Created/updated {name} ({ds} | {recurrence} | {timeframe}) -> status: OK")
+            except RuntimeError as ex:
+                print(f"  WARN: Failed to create {name} ({ds} | {recurrence}): {ex}")
+                continue
+
+    print("\nDone.")
+
+
+# ---------- CLI ----------
+def build_scope_id(args) -> str:
+    if args.scope_id:
+        return args.scope_id.strip()
+    if args.scope_type == "subscription":
+        return f"/subscriptions/{args.subscription_id}"
+    if args.scope_type == "resourceGroup":
+        return f"/subscriptions/{args.subscription_id}/resourceGroups/{args.resource_group}"
+    if args.scope_type == "managementGroup":
+        return f"/providers/Microsoft.Management/managementGroups/{args.management_group_id}"
+    if args.scope_type == "billingAccount":
+        return f"/providers/Microsoft.Billing/billingAccounts/{args.billing_account_id}"
+    if args.scope_type == "billingProfile":
+        return (f"/providers/Microsoft.Billing/billingAccounts/{args.billing_account_id}"
+                f"/billingProfiles/{args.billing_profile_id}")
+    if args.scope_type == "invoiceSection":
+        return (f"/providers/Microsoft.Billing/billingAccounts/{args.billing_account_id}"
+                f"/billingProfiles/{args.billing_profile_id}/invoiceSections/{args.invoice_section_id}")
+    raise ValueError(f"Unsupported or incomplete scope args: {args.scope_type}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Deploy FinlytHub infra (optional) and create Cost Management export.")
+    ap.add_argument("--interactive", action="store_true", help="Run in guided interactive mode")
+    ap.add_argument("--settings", default=SETTINGS_FILE)
+    # Scope selection
+    ap.add_argument("--scope-id", help="Full scope ARM ID for export (overrides scope-type args)")
+    ap.add_argument("--scope-type", choices=["subscription","resourceGroup","managementGroup","billingAccount","billingProfile","invoiceSection"])
+    ap.add_argument("--subscription-id")
+    ap.add_argument("--resource-group")
+    ap.add_argument("--management-group-id")
+    ap.add_argument("--billing-account-id")
+    ap.add_argument("--billing-profile-id")
+    ap.add_argument("--invoice-section-id")
+
+    # Export config
+    ap.add_argument("--export-name", required=False)
+    ap.add_argument("--dataset", choices=["ActualCost","AmortizedCost","Usage","FOCUS"], default="FOCUS")
+    ap.add_argument("--format", choices=["Csv","Parquet"], default="Parquet")
+    ap.add_argument("--recurrence", choices=["Daily","Weekly","Monthly"], default="Daily")
+    ap.add_argument("--timeframe", choices=["Custom","MTD"], default="Custom")
+    ap.add_argument("--from-date", dest="from_date", help="Start date for Custom timeframe (YYYY-MM-DD)")
+    ap.add_argument("--to-date", dest="to_date", help="End date for Custom timeframe (YYYY-MM-DD)")
+    ap.add_argument("--compression", choices=["None","Gzip","Snappy"])
+    ap.add_argument("--overwrite", action="store_true")
+
+    # Destination
+    ap.add_argument("--dest-subscription-id", help="Subscription hosting the storage account (if creating/ensuring)")
+    ap.add_argument("--dest-location", default="eastus")
+    ap.add_argument("--dest-rg")
+    ap.add_argument("--dest-sa")
+    ap.add_argument("--dest-container")
+    ap.add_argument("--dest-root")
+
+    # Infra mode
+    ap.add_argument("--use-bicep", action="store_true", help="Deploy/ensure destination via Bicep template")
+    ap.add_argument("--bicep-template", default="./02_finlythub_deploy.bicep")
+    ap.add_argument("--hub-name", help="Storage account name when using Bicep")
+    ap.add_argument("--mi-name", help="UAMI name when using Bicep")
+    ap.add_argument("--storage-sku", default="Standard_LRS")
+    ap.add_argument("--tags", default='{"Application":"FinlytHub"}', help="JSON object for tags")
+
+    args = ap.parse_args()
+    cred = DefaultAzureCredential()
+
+    # Load settings and seed defaults
+    settings = load_settings(args.settings) if os.path.exists(args.settings) else {}
+    seeded = suggest_defaults_from_settings(settings)
+
+    if args.interactive:
+        interactive_flow(cred, settings)
+        return
+    
+    if not args.interactive and not args.export_name:
+        raise RuntimeError("Missing required --export-name in non-interactive mode.")
+
+    # Determine scope id
+    scope_id = args.scope_id or (build_scope_id(args) if args.scope_type else seeded.get("scope_id"))
+    if not scope_id:
+        raise RuntimeError("No scope specified. Use --scope-id or --scope-type ... to define export scope.")
+
+    # Determine destination (prefer CLI, then settings)
+    dest_container = args.dest_container or seeded.get("dest_container") or "cost"
+    dest_root      = args.dest_root      or seeded.get("dest_root") or ""
+    tags = {}
+    try:
+        tags = json.loads(args.tags) if isinstance(args.tags, str) else (args.tags or {})
+    except Exception:
+        tags = {"Application": "FinlytHub"}
+
+    # If using Bicep: deploy/ensure destination SA + containers + UAMI
+    export_dest_resource_id = None
+    if args.use_bicep:
+        # Need: dest subscription + RG + hub_name + mi_name + location
+        if not (args.dest_subscription_id and args.dest_rg):
+            raise RuntimeError("--use-bicep requires --dest-subscription-id and --dest-rg")
+        hub_name = args.hub_name or f"finlythub{uuid.uuid4().hex[:8]}"
+        mi_name  = args.mi_name  or f"{hub_name}-mi"
+
+        # Derive location from --dest-location (or leave as default)
+        meta = deploy_finlythub_via_bicep(
+            cred=cred,
+            subscription_id=args.dest_subscription_id,
+            rg_name=args.dest_rg,
+            bicep_path=args.bicep_template,
+            hub_name=hub_name,
+            mi_name=mi_name,
+            location=args.dest_location,
+            tags=tags
+        )
+        # Ensure a target container (prefer 'daily' if dataset is FOCUS; else use provided)
+        chosen_container = dest_container or meta["containers"].get("daily") or "daily"
+        # Make sure it exists (bicep already created the standard containers; this is a no-op if present)
+        ensure_container(cred, meta["storage_account_name"], chosen_container)
+
+        export_dest_resource_id = meta["resource_id"]
+        dest_container = chosen_container
+
+    else:
+        # SDK ensure path (no UAMI by default)
+        # Require destination subscription + RG + SA + container
+        if not (args.dest_subscription_id and args.dest_rg and args.dest_sa):
+            # Fallback to settings if present
+            sa_id = seeded.get("dest_resource_id")
+            if not sa_id:
+                raise RuntimeError("Destination not fully specified. Provide --dest-subscription-id --dest-rg --dest-sa (and --dest-container).")
+            export_dest_resource_id = sa_id
+        else:
+            ensure_rg(cred, args.dest_subscription_id, args.dest_rg, args.dest_location)
+            ensure_sa(cred, args.dest_subscription_id, args.dest_rg, args.dest_sa, args.dest_location, args.storage_sku)
+            ensure_container(cred, args.dest_sa, dest_container)
+            export_dest_resource_id = (f"/subscriptions/{args.dest_subscription_id}/resourceGroups/{args.dest_rg}"
+                                       f"/providers/Microsoft.Storage/storageAccounts/{args.dest_sa}")
+
+    # Build export body and create/update
+    export_body = build_export_body(
+        dataset=args.dataset, recurrence=args.recurrence,
+        dest_resource_id=export_dest_resource_id, container=dest_container, root=dest_root,
+        fmt=args.format, timeframe=args.timeframe,
+        from_date=args.from_date, to_date=args.to_date,
+        compression=(None if (args.compression in (None, "None")) else args.compression),
+        overwrite=args.overwrite
+    )
+    result = create_or_update_export(cred, scope_id, args.export_name, export_body)
+
+    print(json.dumps({
+        "scope_id": scope_id,
+        "export_name": args.export_name,
+        "destination": {
+            "resource_id": export_dest_resource_id,
+            "container": dest_container,
+            "root_path": dest_root
+        },
+        "result": result
+    }, indent=2))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(1)
