@@ -17,10 +17,7 @@ param tags object = {
 @description('Name of the user-assigned managed identity used by FinlytHub ops.')
 param miName string = '${hubName}-mi'
 
-@description('Optional timestamp injected by deployment script (not used by resources).')
-@allowed([
-  ''
-])
+@description('Optional timestamp injected by deployment script (not used by resources). Any string accepted.')
 param deploymentTimestamp string = ''
 
 // ----------------- Storage (FinlytHub) -----------------

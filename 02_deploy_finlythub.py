@@ -59,6 +59,15 @@ def ensure_sa(cred, subscription_id: str, rg_name: str, sa_name: str, location: 
     )
     poller.result()
 
+def is_storage_account_name_available(cred, subscription_id: str, name: str) -> tuple[bool, str | None]:
+    """Check global availability of a storage account name. Returns (available, reason)."""
+    try:
+        sm = StorageManagementClient(cred, subscription_id)
+        resp = sm.storage_accounts.check_name_availability({"name": name, "type": "Microsoft.Storage/storageAccounts"})
+        return (bool(getattr(resp, 'name_available', False)), getattr(resp, 'message', None))
+    except Exception as ex:
+        return (True, f"check_name_availability_failed: {ex}")
+
 def ensure_container(cred, sa_name: str, container: str):
     blob = BlobServiceClient(f"https://{sa_name}.blob.core.windows.net", credential=cred)
     cc = blob.get_container_client(container)
@@ -73,12 +82,28 @@ def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_p
     Uses 'az deployment group create' for simplicity to deploy the compiled template.
     You can replace with SDK-based ARM deployment if you prefer.
     """
-    # Ensure RG exists
+    # Ensure RG exists first
     ensure_rg(cred, subscription_id, rg_name, location)
 
-    # Compile
-    from finlyt_common import compile_bicep_to_json
-    template_json = compile_bicep_to_json(bicep_path)
+    # Always (re)compile Bicep AFTER RG confirmation to avoid stale template or path issues
+    def _recompile_bicep(src: str) -> str:
+        base, _ = os.path.splitext(src)
+        out_path = base + ".deploy.json"
+        try:
+            # Prefer direct az bicep build to guarantee fresh output
+            cmd = ["az","bicep","build","--file", src, "--outfile", out_path]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"bicep build failed: {proc.stderr or proc.stdout}")
+            print(f"[bicep] Recompiled {src} -> {out_path}")
+            return out_path
+        except Exception as ex:
+            # Fallback to existing helper if direct build fails
+            from finlyt_common import compile_bicep_to_json
+            print(f"[bicep] Direct build failed ({ex}); falling back to compile_bicep_to_json helper.")
+            return compile_bicep_to_json(src)
+
+    template_json = _recompile_bicep(bicep_path)
 
     # CLI group deployment (keeps parity with your current approach)
     cmd = [
@@ -94,19 +119,73 @@ def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_p
             f"tags={json.dumps(tags)}"
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
+    log_path = f"./deploy_{hub_name}_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.log"
+    # Always persist logs (even on success) if AZURE_FINLYT_DEBUG env var is set
+    if proc.returncode != 0 or os.getenv('AZURE_FINLYT_DEBUG'):
+        try:
+            with open(log_path, 'w') as lf:
+                lf.write('COMMAND: ' + ' '.join(cmd) + '\n')
+                lf.write('\nSTDOUT:\n' + (proc.stdout or ''))
+                lf.write('\n\nSTDERR:\n' + (proc.stderr or ''))
+        except Exception:
+            pass
     if proc.returncode != 0:
-        # Provide richer diagnostics including stdout and stderr. Some az errors stream pieces to stdout.
         combined = (proc.stderr or '')
         if proc.stdout:
             combined += "\n[stdout]\n" + proc.stdout
+        lower = combined.lower()
         hint = ''
-        if 'authorizationfailed' in combined.lower():
+        if 'authorizationfailed' in lower:
             hint = '\nHint: Ensure you have at least Contributor on the resource group and subscription.'
-        elif 'invalidparameter' in combined.lower():
+        elif 'invalidparameter' in lower:
             hint = '\nHint: Validate parameter values (hubName uniqueness, location spelling).'
-        elif 'not found' in combined.lower() and 'resource group' in combined.lower():
+        elif 'storageaccountalreadytaken' in lower or 'anotherobjectwiththesamename' in lower:
+            hint = '\nHint: Storage account name already in use globally. Pick a different hub name.'
+        elif 'not found' in lower and 'resource group' in lower:
             hint = '\nHint: Resource group creation may have failed; check permissions.'
-        raise RuntimeError(f"Bicep deployment failed (exit {proc.returncode}):\n{combined}{hint}")
+        # Fallback to SDK if specific consumption error appears
+        if 'the content for this response was already consumed' in lower or 'already consumed' in lower:
+            try:
+                from azure.mgmt.resource import ResourceManagementClient
+                with open(template_json,'r') as tf:
+                    template_doc = json.load(tf)
+                rm = ResourceManagementClient(cred, subscription_id)
+                params = {
+                    'hubName': {'value': hub_name},
+                    'miName': {'value': mi_name},
+                    'location': {'value': location},
+                    'deploymentTimestamp': {'value': datetime.now(UTC).isoformat()},
+                    'tags': {'value': tags}
+                }
+                print("[fallback] Retrying deployment via SDK (ARM) due to CLI response consumption error.")
+                poller = rm.deployments.begin_create_or_update(
+                    rg_name,
+                    f"finlythub-{hub_name}",
+                    {"properties": {"mode": "Incremental", "template": template_doc, "parameters": params}}
+                )
+                dep_result = poller.result()
+                try:
+                    outputs = getattr(dep_result.properties, 'outputs', {}) or {}
+                except Exception:
+                    outputs = {}
+                return {
+                    "resource_id": outputs.get("storageAccountId", {}).get("value") or
+                                   f"/subscriptions/{subscription_id}/resourceGroups/{rg_name}/providers/Microsoft.Storage/storageAccounts/{hub_name}",
+                    "storage_account_name": outputs.get("storageAccountName", {}).get("value") or hub_name,
+                    "uami": {
+                        "id": outputs.get("uamiId", {}).get("value"),
+                        "principal_id": outputs.get("uamiPrincipalId", {}).get("value"),
+                        "client_id": outputs.get("uamiClientId", {}).get("value")
+                    },
+                    "containers": {
+                        "daily": outputs.get("dailyContainerName", {}).get("value") or "daily",
+                        "monthly": outputs.get("monthlyContainerName", {}).get("value") or "monthly",
+                        "reservation": outputs.get("reservationContainerName", {}).get("value") or "reservation"
+                    }
+                }
+            except Exception as sdk_ex:
+                raise RuntimeError(f"Bicep deployment failed (exit {proc.returncode}) and SDK fallback failed: {sdk_ex}\nSee {log_path}\n{combined}{hint}")
+        raise RuntimeError(f"Bicep deployment failed (exit {proc.returncode})\nLog: {log_path}\n{combined}{hint}")
 
     try:
         body = json.loads(proc.stdout)
@@ -527,71 +606,178 @@ def interactive_flow(cred, settings):
             inv = _validate_component('Invoice section ID', inv_in, rec_parsed.get('invoiceSection'))
             scope_id = f"/providers/Microsoft.Billing/billingAccounts/{ba}/billingProfiles/{bp}/invoiceSections/{inv}"
 
-    # Offer destination storage recommendation before proceeding
+    # Offer destination storage recommendation before proceeding; allow override
     seeded_defaults = suggest_defaults_from_settings(settings)
     rec_dest_id = (seeded_defaults or {}).get('dest_resource_id')
+    override_meta: dict | None = None
     if rec_dest_id:
         print(f"\nSelect destination Storage for {scope_id}:")
         print(f"  Recommended: {rec_dest_id}")
-        _ = _prompt("Use recommended destination? (Y/n)", "Y")  # Currently informational; underlying logic will reuse if present
-
-    # 2) Always deploy/ensure hub via Bicep (names not user-editable)
-    finlyt = settings.get('finlyt', {}) if isinstance(settings, dict) else {}
-    dest_sub = (finlyt.get('subscription', {}) or {}).get('id')
-    dest_rg  = (finlyt.get('resource_group', {}) or {}).get('name')
-    dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
-    if not dest_sub:
-        # If scope is subscription or RG, infer sub id
-        # robust extraction: look for /subscriptions/{subId} and /resourceGroups/{rg}
-        import re
-        m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
-        if m_sub:
-            dest_sub = m_sub.group(1)
-        else:
-            # no subscription in scope - leave dest_sub as None (e.g. billing profile scope)
-            dest_sub = None
-        # also try to extract resource group (optional)
-        m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
-        if m_rg:
-            dest_rg = m_rg.group(1)
-    if not dest_rg and dest_sub:
-        dest_rg = f"rg-finlythub-{dest_sub[:8]}"
-    if not dest_sub or not dest_rg:
-        raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
-
-    suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
-    hub_name = f"finlythub{suffix}"
-    mi_name  = f"{hub_name}-mi"
-
-    # Reuse existing storage account if already detected in settings
-    existing_sa_id = (finlyt.get('Storage_account') or {}).get('id') if isinstance(finlyt, dict) else None
-    meta = None
-    if existing_sa_id:
-        parsed = _parse_storage_account_id(existing_sa_id)
-        if parsed.get('subscription') == dest_sub and parsed.get('resourceGroup') == dest_rg:
-            meta = {
-                'resource_id': existing_sa_id,
-                'storage_account_name': parsed.get('name'),
-                'uami': {},
-                'containers': {}
-            }
-            # Ensure standard containers exist
-            for c in ['daily','monthly','reservation']:
+        use_dest = _prompt("Use recommended destination? (Y/n)", "Y").lower().startswith('y')
+        if not use_dest:
+            # Override flow
+            print("\nDestination override selected.")
+            mode = _choose("Choose destination mode:", ["Existing storage account","Deploy new FinlytHub (Bicep)"] ,0)
+            if mode == "Existing storage account":
+                # Collect subscription + RG + SA name; ensure (or create) containers
+                import re
+                while True:
+                    o_sub = _prompt("Destination subscription ID")
+                    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", o_sub):
+                        print(" Invalid subscription GUID format.")
+                        continue
+                    break
+                o_rg = _prompt("Destination resource group name")
+                o_sa = _prompt("Existing or new storage account name")
+                o_loc = _prompt("Location (for RG/SA creation if needed)", "eastus") or "eastus"
                 try:
-                    ensure_container(cred, parsed.get('name'), c)
-                except Exception:
-                    pass
-    if meta is None:
-        meta = deploy_finlythub_via_bicep(
-            cred=cred,
-            subscription_id=dest_sub,
-            rg_name=dest_rg,
-            bicep_path="./02_finlythub_deploy.bicep",
-            hub_name=hub_name,
-            mi_name=mi_name,
-            location=dest_loc,
-            tags={"Application":"FinlytHub"}
-        )
+                    ensure_rg(cred, o_sub, o_rg, o_loc)
+                    ensure_sa(cred, o_sub, o_rg, o_sa, o_loc)
+                except Exception as ex:
+                    print(f" Failed to ensure storage account: {ex}")
+                    sys.exit(1)
+                for c in ["daily","monthly","reservation"]:
+                    try:
+                        ensure_container(cred, o_sa, c)
+                    except Exception:
+                        pass
+                override_meta = {
+                    "resource_id": f"/subscriptions/{o_sub}/resourceGroups/{o_rg}/providers/Microsoft.Storage/storageAccounts/{o_sa}",
+                    "storage_account_name": o_sa,
+                    "uami": {},
+                    "containers": {"daily":"daily","monthly":"monthly","reservation":"reservation"}
+                }
+            else:
+                # Bicep override path: collect (optionally different) sub / RG / location / hub name
+                import re
+                print(" Will deploy a NEW FinlytHub via Bicep (override). Leave blank to accept defaults shown in [] where offered.")
+                # Derive a default subscription from scope or settings
+                def _extract_sub_from_scope(sid: str) -> str | None:
+                    m = re.search(r"/subscriptions/([0-9a-fA-F-]{36})", sid or "")
+                    return m.group(1) if m else None
+                default_sub = _extract_sub_from_scope(scope_id) or _extract_sub_from_scope(rec_scope_id) or ''
+                while True:
+                    o_sub = _prompt(f"Destination subscription ID", default_sub) or default_sub
+                    if not o_sub:
+                        print(" Subscription ID is required.")
+                        continue
+                    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", o_sub):
+                        print(" Invalid subscription GUID format.")
+                        continue
+                    break
+                # Resource group default derives from first 8 chars of sub
+                rg_default = f"rg-finlythub-{o_sub[:8]}"
+                o_rg = _prompt("Destination resource group name", rg_default) or rg_default
+                loc_default = "eastus"
+                o_loc = _prompt("Location", loc_default) or loc_default
+                # Hub name default is deterministic (sha1)
+                suffix = hashlib.sha1(o_sub.encode()).hexdigest()[:8]
+                hub_default = f"finlythub{suffix}"
+                o_hub = _prompt("FinlytHub storage account name", hub_default) or hub_default
+                mi_default = f"{o_hub}-mi"
+                o_mi = _prompt("User-assigned identity name", mi_default) or mi_default
+                # Name availability check loop
+                while True:
+                    avail, reason = is_storage_account_name_available(cred, o_sub, o_hub)
+                    if avail:
+                        break
+                    print(f"  Storage account name '{o_hub}' not available. {reason or ''}".strip())
+                    o_hub = _prompt("Enter a different storage account name")
+                    if not o_hub:
+                        continue
+                # Also basic format validation
+                import re as _re
+                if not _re.fullmatch(r"[a-z0-9]{3,24}", o_hub):
+                    print("  Name violates format rules (lowercase letters/digits 3-24). Auto-adjusting.")
+                    cleaned = ''.join(ch for ch in o_hub.lower() if ch.isalnum())[:24]
+                    if len(cleaned) < 3:
+                        cleaned = (cleaned + 'fin')[:3]
+                    o_hub = cleaned
+                # If this exactly matches the recommended destination, warn & allow retry
+                rec_id_norm = rec_dest_id.lower() if rec_dest_id else None
+                attempt_warned = False
+                while True:
+                    candidate_id = (f"/subscriptions/{o_sub}/resourceGroups/{o_rg}/providers/"
+                                    f"Microsoft.Storage/storageAccounts/{o_hub}")
+                    if rec_id_norm and candidate_id.lower() == rec_id_norm and not attempt_warned:
+                        print(" WARNING: Chosen override values produce the SAME destination as the recommended one.")
+                        cont = _prompt("Proceed anyway? (y/N)", "N").lower().startswith('y')
+                        if cont:
+                            break
+                        # allow user to change hub or RG
+                        o_rg = _prompt("Destination resource group name (re-enter)", o_rg) or o_rg
+                        o_hub = _prompt("FinlytHub storage account name (re-enter)", o_hub) or o_hub
+                        attempt_warned = True
+                        continue
+                    break
+                print(f" Deploying override FinlytHub: {candidate_id}")
+                try:
+                    override_meta = deploy_finlythub_via_bicep(
+                        cred=cred,
+                        subscription_id=o_sub,
+                        rg_name=o_rg,
+                        bicep_path="./02_finlythub_deploy.bicep",
+                        hub_name=o_hub,
+                        mi_name=o_mi,
+                        location=o_loc,
+                        tags={"Application":"FinlytHub","Mode":"Override"}
+                    )
+                except Exception as ex:
+                    print(f" Failed override Bicep deployment: {ex}")
+                    sys.exit(1)
+
+    # 2) Destination ensure/deploy
+    if override_meta is not None:
+        meta = override_meta
+    else:
+        finlyt = settings.get('finlyt', {}) if isinstance(settings, dict) else {}
+        dest_sub = (finlyt.get('subscription', {}) or {}).get('id')
+        dest_rg  = (finlyt.get('resource_group', {}) or {}).get('name')
+        dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
+        if not dest_sub:
+            import re
+            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
+            if m_sub:
+                dest_sub = m_sub.group(1)
+            else:
+                dest_sub = None
+            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
+            if m_rg:
+                dest_rg = m_rg.group(1)
+        if not dest_rg and dest_sub:
+            dest_rg = f"rg-finlythub-{dest_sub[:8]}"
+        if not dest_sub or not dest_rg:
+            raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
+        suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
+        hub_name = f"finlythub{suffix}"
+        mi_name  = f"{hub_name}-mi"
+        existing_sa_id = (finlyt.get('Storage_account') or {}).get('id') if isinstance(finlyt, dict) else None
+        meta = None
+        if existing_sa_id:
+            parsed = _parse_storage_account_id(existing_sa_id)
+            if parsed.get('subscription') == dest_sub and parsed.get('resourceGroup') == dest_rg:
+                meta = {
+                    'resource_id': existing_sa_id,
+                    'storage_account_name': parsed.get('name'),
+                    'uami': {},
+                    'containers': {}
+                }
+                for c in ['daily','monthly','reservation']:
+                    try:
+                        ensure_container(cred, parsed.get('name'), c)
+                    except Exception:
+                        pass
+        if meta is None:
+            meta = deploy_finlythub_via_bicep(
+                cred=cred,
+                subscription_id=dest_sub,
+                rg_name=dest_rg,
+                bicep_path="./02_finlythub_deploy.bicep",
+                hub_name=hub_name,
+                mi_name=mi_name,
+                location=dest_loc,
+                tags={"Application":"FinlytHub"}
+            )
 
     export_dest_resource_id = meta["resource_id"]
     containers = meta.get('containers', {})
