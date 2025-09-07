@@ -192,6 +192,7 @@ def main():
     ap.add_argument('--skip-detect', action='store_true', help='Skip detection phase (assume settings current).')
     ap.add_argument('--force-deploy', action='store_true', help='Force deploy even if focus export already exists.')
     ap.add_argument('--deploy-interactive', action='store_true', help='Enter deploy script interactive mode after detection.')
+    ap.add_argument('--cleanup', action='store_true', help='Run interactive cleanup (exports + tagged resources) after detection and skip deploy logic.')
     ap.add_argument('--dry-run', action='store_true', help='Show actions without executing deploy.')
     ap.add_argument('--export-name', help='Override export name (default finlyt_focus_daily)')
     ap.add_argument('--scope-id', help='Override scope id (else use recommended or subscription).')
@@ -208,8 +209,8 @@ def main():
     # Rebind module-level SETTINGS_FILE to user-specified path (allowed)
     SETTINGS_FILE = args.settings
 
-    if not args.auto and not args.deploy_interactive:
-        _log('Nothing to do (specify --auto or --deploy-interactive).')
+    if not args.auto and not args.deploy_interactive and not args.cleanup:
+        _log('Nothing to do (specify --auto, --deploy-interactive, or --cleanup).')
         return 0
 
     # 1. Detection (unless skipped)
@@ -233,9 +234,16 @@ def main():
     _log('Analysis: ' + json.dumps({k: v for k, v in analysis.items() if k not in ('dest_resource_id',)}, indent=2))
 
     # If not eligible and no hub present, abort unless user forces
-    if not analysis['eligible_for_export'] and not args.force_deploy and not args.deploy_interactive:
+    if not analysis['eligible_for_export'] and not args.force_deploy and not args.deploy_interactive and not args.cleanup:
         _log('Environment not eligible for export setup (can_setup_exports.eligible_for_export = false). Use --force-deploy to override.')
         return 3
+
+    # Cleanup mode shortcut
+    if args.cleanup:
+        _log('Launching interactive cleanup (03_cleanup_finlythub.py)...')
+        import subprocess as _sp
+        rc2 = _sp.call([sys.executable, '03_cleanup_finlythub.py'])
+        return rc2
 
     # 3. Build deploy command
     try:
