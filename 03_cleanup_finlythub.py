@@ -21,6 +21,12 @@ RESOURCE_API = "2022-09-01"
 MI_API = "2023-01-31"
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
 
+# Diagnostic / safety flags (override via env)
+SHOW_DEST_ID = os.getenv("FINLYT_SHOW_DEST", "0") == "1"  # include destination resourceId column
+VALIDATE_SA  = os.getenv("FINLYT_VALIDATE_SA", "1") == "1"  # GET each storage account to confirm existence
+PER_ITEM_CONFIRM = os.getenv("FINLYT_PER_ITEM_CONFIRM", "1") == "1"  # ask per item before deletion
+DEBUG_EXPORT = os.getenv("FINLYT_DEBUG", "0") == "1"  # verbose schedule debug
+
 
 # ------------- Helpers -------------
 def load_settings(path: str) -> Dict[str, Any]:
@@ -91,6 +97,25 @@ def _extract_storage_from_dest(resource_id: str) -> str:
         return ''
     m = re.search(r"/storageAccounts/([^/]+)", resource_id, re.IGNORECASE)
     return m.group(1) if m else ''
+
+def _parse_sa_id(resource_id: str):
+    if not resource_id:
+        return None, None, None
+    m = re.match(r"/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)", resource_id, re.IGNORECASE)
+    if not m:
+        return None, None, None
+    return m.group(1), m.group(2), m.group(3)
+
+def _sa_exists(cred, resource_id: str) -> bool:
+    sub, rg, name = _parse_sa_id(resource_id)
+    if not sub:
+        return False
+    token = get_token(cred)
+    headers = {"Authorization": f"Bearer {token}"}
+    url = (f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/"
+           f"Microsoft.Storage/storageAccounts/{name}?api-version={RESOURCE_API}")
+    r = http_with_backoff(requests.get, url, headers=headers, timeout=30)
+    return bool(r and r.status_code == 200)
 
 
 def fetch_exports(cred, scope_id: str) -> List[Dict[str, Any]]:
@@ -231,6 +256,27 @@ def get_export_creation_time(cred, scope_id: str, export_name: str) -> Optional[
     return None
 
 
+def get_export_schedule_times(cred, scope_id: str, export_name: str) -> dict:
+    """Fetch schedule for a given export to obtain nextRun/lastRun times.
+    Returns dict with keys nextRun, lastRun (or empty if not found)."""
+    token = get_token(cred)
+    headers = {"Authorization": f"Bearer {token}"}
+    url = (f"https://management.azure.com/{scope_id}/providers/Microsoft.CostManagement/exports/"
+           f"{export_name}?api-version={EXPORTS_API}")
+    try:
+        r = http_with_backoff(requests.get, url, headers=headers, timeout=60)
+        if r is None or r.status_code not in (200, 201):
+            return {}
+        data = r.json() or {}
+        props = data.get('properties', {}) or {}
+        schedule = props.get('schedule', {}) or {}
+        nxt = (schedule.get('nextRunTime') or schedule.get('nextRunDateTime'))
+        lst = (schedule.get('lastRunTime') or schedule.get('lastRunDateTime'))
+        return {k: v for k, v in (('nextRun', nxt), ('lastRun', lst)) if v}
+    except Exception:
+        return {}
+
+
 def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
     print("FinlytHub Cleanup Utility")
     print("This tool lists Cost Management exports and Azure resources tagged with Application=FinlytHub.")
@@ -293,8 +339,9 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
     if not scopes:
         print("No scopes selected. You can still clean tagged resources only.")
 
-    all_export_rows: List[Dict[str, Any]] = []
-    export_index_map: List[tuple[str,str]] = []  # (scope_id, export_name)
+    all_export_rows: List[Dict[str, Any]] = []  # holds export rows (will be sorted)
+    # export_index_map will be (re)built AFTER sorting to maintain alignment with displayed order
+    export_index_map: List[tuple[str,str]] = []
     for sc in scopes:
         exports = fetch_exports(cred, sc)
         for ex in exports:
@@ -305,30 +352,83 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
             name = ex.get('name')
             recurrence = schedule.get('recurrence')
             status = schedule.get('status')
-            next_run = schedule.get('nextRunTime') or '-'
+            # Add fallback for nextRunTimeEstimate
+            next_run = (schedule.get('nextRunTime') or schedule.get('nextRunDateTime') or schedule.get('nextRunTimeEstimate') or '-')
+            last_run = (schedule.get('lastRunTime') or schedule.get('lastRunDateTime') or '-')
             container = delivery.get('container') or ''
             root = delivery.get('rootFolderPath') or ''
             dest_res_id = delivery.get('resourceId') or ''
             sa = _extract_storage_from_dest(dest_res_id)
             fmt = props.get('format') or definition.get('format') or ''
             comp = props.get('compressionMode') or props.get('compression') or ''
+            # Flatten definition & schedule metadata
+            timeframe = definition.get('timeframe')
+            def_type = definition.get('type')
+            time_period = (definition.get('timePeriod') or {}) or {}
+            date_from = time_period.get('from')
+            date_to = time_period.get('to')
+            dataset = (definition.get('dataSet') or {}) or {}
+            dataset_type = dataset.get('dataSetType')
+            granularity = dataset.get('granularity')
+            dataset_cfg = (dataset.get('configuration') or {}) or {}
+            partition = dataset_cfg.get('partitionData')
+            file_pattern = dataset_cfg.get('filePattern')
+            overwrite = delivery.get('overwrite') or delivery.get('overwriteExisting')
+            # Normalize data overwrite behavior (prefer explicit property, else derive)
+            data_overwrite_behavior = (
+                props.get('dataOverwriteBehavior')
+                or delivery.get('dataOverwriteBehavior')
+                or (('Overwrite' if overwrite is True else 'Append') if overwrite in (True, False) else None)
+            )
+            rec_period = (schedule.get('recurrencePeriod') or {}) or {}
+            rec_from = rec_period.get('from')
+            rec_to = rec_period.get('to')
+            # Per request: surface from properties, not schedule
+            next_run_est = props.get('nextRunTimeEstimate')
             created = get_export_creation_time(cred, sc, name) or '-'
+            # If next/last run missing, attempt per-export GET to populate schedule times
+            if next_run == '-' or last_run == '-':
+                sched_times = get_export_schedule_times(cred, sc, name)
+                if next_run == '-' and sched_times.get('nextRun'):
+                    next_run = sched_times['nextRun']
+                if last_run == '-' and sched_times.get('lastRun'):
+                    last_run = sched_times['lastRun']
+            if DEBUG_EXPORT:
+                print(f"[debug] export={name} scheduleKeys={list(schedule.keys())} next={next_run} last={last_run} dest={dest_res_id} timeframe={timeframe} recPeriod=({rec_from},{rec_to}) datasetType={dataset_type} granularity={granularity}")
             row = {
                 'scope': sc,
                 'location': '-',
                 'created': created,
                 'name': name,
+                'type': def_type,
                 'recurrence': recurrence,
                 'status': status,
                 'nextRun': next_run,
+                'lastRun': last_run,
+                'nextRunTimeEstimate': next_run_est or '-',
                 'container': container,
                 'root': root,
                 'storage': sa,
+                'storageaccount': sa,
+                'destId': dest_res_id,
+                'saState': 'UNKNOWN',
                 'format': fmt,
                 'compression': comp,
+                'compressionMode': comp,
+                'timeframe': timeframe,
+                'dateFrom': date_from,
+                'dateTo': date_to,
+                'datasetType': dataset_type,
+                'granularity': granularity,
+                'partition': partition,
+                'filePattern': file_pattern,
+                'overwrite': overwrite,
+                'DataOverwriteBehavior': props.get('dataOverwriteBehavior') or '-',
+                'recFrom': rec_from,
+                'recTo': rec_to,
+                'orphan': 'UNKNOWN',
             }
             all_export_rows.append(row)
-            export_index_map.append((sc, name))
 
     # Sort exports by created desc (unknown at bottom)
     def _exp_sort_key(r: Dict[str, Any]):
@@ -336,25 +436,33 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         return (0 if dt else 1, -(dt.timestamp()) if dt else 0)
     all_export_rows.sort(key=_exp_sort_key)
 
+    # Rebuild index map after sorting to align with visual order
+    export_index_map = [(r['scope'], r['name']) for r in all_export_rows]
+
     export_columns = [
-        ('created','Created'),
-        ('location','Location'),
-        ('name','Export'),
+        ('name','Export Name'),
+        ('type','Type'),
         ('recurrence','Recurrence'),
+        ('recFrom','RecFrom'),
+        ('recTo','RecTo'),
         ('status','Status'),
-        ('nextRun','NextRun'),
+        ('nextRunTimeEstimate','nextRunTimeEstimate'),
+        ('timeframe','Timeframe'),
+        ('granularity','Granularity'),
+    ('DataOverwriteBehavior','DataOverwriteBehavior'),
+        ('format','format'),
+        ('compressionMode','compressionMode'),
         ('container','Container'),
-        ('root','Root'),
-        ('storage','StorageAccount'),
-        ('format','Format'),
-        ('compression','Compression')
+        ('root','root'),
+        ('storageaccount','storageaccount')
     ]
     _print_table(all_export_rows, export_columns, 'Exports')
 
     # Tagged resources
     sub_id = ((settings.get('finlyt', {}) or {}).get('subscription', {}) or {}).get('id')
-    tagged_rows: List[Dict[str, Any]] = []
-    tagged_index_map: List[str] = []
+    tagged_rows: List[Dict[str, Any]] = []  # will be sorted
+    tagged_index_map: List[str] = []  # rebuilt after sort
+    tagged_storage_names: set[str] = set()
     if sub_id:
         # Generic resources (excludes resource groups)
         tag_resources = list_tagged_resources(cred, sub_id)
@@ -368,7 +476,8 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
                 'name': r.get('name',''),
                 'id': rid,
             })
-            tagged_index_map.append(rid)
+            if isinstance(r.get('type',''), str) and r.get('type','').lower().endswith('storageaccounts'):
+                tagged_storage_names.add(r.get('name',''))
         # Resource groups with tag
         rg_list = list_tagged_resource_groups(cred, sub_id)
         for rg in rg_list:
@@ -381,7 +490,6 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
                 'name': rg.get('name',''),
                 'id': rid,
             })
-            tagged_index_map.append(rid)
     else:
         print("No subscription id in settings.finlyt.subscription.id; skipping tagged resource scan.")
 
@@ -390,6 +498,27 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         dt = _parse_dt(r.get('created'))
         return (0 if dt else 1, -(dt.timestamp()) if dt else 0)
     tagged_rows.sort(key=_res_sort_key)
+    tagged_index_map = [r['id'] for r in tagged_rows]
+
+    # Validate storage accounts referenced by exports (existence + tag presence)
+    if VALIDATE_SA:
+        for r in all_export_rows:
+            dest_id = r.get('destId')
+            if not r.get('storage'):
+                r['saState'] = 'NONE'
+                r['orphan'] = 'NO'
+                continue
+            exists = _sa_exists(cred, dest_id) if dest_id else False
+            if not exists:
+                r['saState'] = 'MISSING'
+                r['orphan'] = 'YES'
+            else:
+                r['saState'] = 'OK' if r.get('storage') in tagged_storage_names else 'UNTAGGED'
+                r['orphan'] = 'NO'
+    else:
+        for r in all_export_rows:
+            if r.get('destId') and r.get('storage'):
+                r['orphan'] = 'NO'
 
     tagged_columns = [
         ('created','Created'),
@@ -405,14 +534,31 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         print("Enter comma-separated numbers from the Exports table to delete. Leave blank to cancel export deletion.")
         idxs = _multiselect_indices(len(all_export_rows), "Export numbers to delete")
         if idxs:
-            confirm = _yesno(f"Confirm deletion of {len(idxs)} exports", False)
-            if confirm:
-                for i in idxs:
-                    sc, ename = export_index_map[i]
-                    ok = delete_export(cred, sc, ename)
-                    print(f" - {'Deleted' if ok else 'FAILED'} export {ename} (scope {sc})")
-            else:
-                print(" Export deletion aborted.")
+            to_delete = [all_export_rows[i] for i in idxs]
+            print(" Selected exports:")
+            for r in to_delete:
+                print(f"  - {r['name']} (scope {r['scope']}) SA={r.get('storage')} state={r.get('saState')} nextRun={r.get('nextRun')} lastRun={r.get('lastRun')}")
+            force = os.getenv('FINLYT_FORCE_DELETE') == '1'
+            if not force:
+                confirm = _yesno(f"Confirm deletion of {len(to_delete)} selected exports?", False)
+                if not confirm:
+                    print(" Export deletion aborted.")
+                    to_delete = []
+            if to_delete:
+                if not force:
+                    final = _prompt("Type DELETE to permanently remove these exports", "")
+                    if final != "DELETE":
+                        print(" Export deletion aborted at final confirmation.")
+                        to_delete = []
+                if to_delete:
+                    for r in to_delete:
+                        if PER_ITEM_CONFIRM and not force:
+                            if not _yesno(f" Delete export {r['name']}?", False):
+                                print(f" Skipped export {r['name']}")
+                                continue
+                        sc, ename = r['scope'], r['name']
+                        ok = delete_export(cred, sc, ename)
+                        print(f" - {'Deleted' if ok else 'FAILED'} export {ename} (scope {sc})")
     else:
         if all_export_rows:
             print(" No export deletions selected.")
@@ -422,14 +568,31 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         print("Enter comma-separated numbers from the Tagged Resources table to delete. Leave blank to cancel.")
         idxs = _multiselect_indices(len(tagged_rows), "Resource numbers to delete")
         if idxs:
-            confirm = _yesno(f"Confirm deletion of {len(idxs)} resources", False)
-            if confirm:
-                for i in idxs:
-                    rid = tagged_index_map[i]
-                    ok = delete_resource(cred, rid)
-                    print(f" - {'Deleted' if ok else 'FAILED'} {rid}")
-            else:
-                print(" Resource deletion aborted.")
+            to_delete_res = [tagged_rows[i] for i in idxs]
+            print(" Selected resources:")
+            for r in to_delete_res:
+                print(f"  - {r['type']} {r['name']} :: {r['id']}")
+            force = os.getenv('FINLYT_FORCE_DELETE') == '1'
+            if not force:
+                confirm = _yesno(f"Confirm deletion of {len(to_delete_res)} selected resources?", False)
+                if not confirm:
+                    print(" Resource deletion aborted.")
+                    to_delete_res = []
+            if to_delete_res:
+                if not force:
+                    final = _prompt("Type DELETE to permanently remove these resources", "")
+                    if final != "DELETE":
+                        print(" Resource deletion aborted at final confirmation.")
+                        to_delete_res = []
+                if to_delete_res:
+                    for r in to_delete_res:
+                        if PER_ITEM_CONFIRM and not force:
+                            if not _yesno(f" Delete resource {r['type']} {r['name']}?", False):
+                                print(f" Skipped {r['id']}")
+                                continue
+                        rid = r['id']
+                        ok = delete_resource(cred, rid)
+                        print(f" - {'Deleted' if ok else 'FAILED'} {rid}")
     else:
         if tagged_rows:
             print(" No resource deletions selected.")
