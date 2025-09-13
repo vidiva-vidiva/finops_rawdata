@@ -24,12 +24,13 @@ import json
 import uuid
 import argparse
 import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional
 from finlyt_common import run_cmd, compile_bicep_to_json, http_with_backoff, get_token
 
 import requests
 import subprocess
+import time
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
@@ -240,7 +241,8 @@ def build_export_body(dataset: str, recurrence: str, dest_resource_id: str,
                       container: str, root: str, fmt: str,
                       timeframe: str = "Custom",
                       from_date: Optional[str] = None, to_date: Optional[str] = None,
-                      compression: Optional[str] = None, overwrite: bool = False) -> Dict[str, Any]:
+                      compression: Optional[str] = None, overwrite: bool = False,
+                      schedule_status: str = "Active") -> Dict[str, Any]:
     """
     Builds request body for Exports Create/Update (2025-03-01).
     Supports all documented timeframe enums. Only includes timePeriod when timeframe=='Custom'.
@@ -260,6 +262,12 @@ def build_export_body(dataset: str, recurrence: str, dest_resource_id: str,
     }
     timeframe_value = tf_map.get(timeframe, timeframe or "Custom")
 
+    # API requires timeframe=Custom only when schedule.status == Inactive (per 2025-03-01 validation observed).
+    # Allow caller to explicitly set schedule_status to 'Inactive' for one-off historical month runs.
+    if timeframe_value == 'Custom' and schedule_status != 'Inactive':
+        # Defensive adjustment to avoid 400 validation error when caller forgets.
+        schedule_status = 'Inactive'
+
     props: Dict[str, Any] = {
         "definition": {
             "type": dtype,
@@ -274,7 +282,7 @@ def build_export_body(dataset: str, recurrence: str, dest_resource_id: str,
         },
         "schedule": {
             "recurrence": recurrence,
-            "status": "Active",
+            "status": schedule_status,
             "recurrencePeriod": {
                 "from": "2020-01-01T00:00:00Z",
                 "to": "2035-12-31T00:00:00Z"
@@ -295,6 +303,167 @@ def build_export_body(dataset: str, recurrence: str, dest_resource_id: str,
     if overwrite:
         props["dataOverwriteBehavior"] = "OverwritePreviousReport"
     return {"properties": props}
+
+
+def run_export(cred, scope_id: str, export_name: str) -> None:
+    """Trigger an on-demand run of an existing export definition."""
+    token = get_token(cred)
+    headers = {"Authorization": f"Bearer {token}"}
+    url = (f"https://management.azure.com/{scope_id}"
+           f"/providers/Microsoft.CostManagement/exports/{export_name}/run?api-version={EXPORTS_API}")
+    r = http_with_backoff(requests.post, url, headers=headers, timeout=60)
+    if r is None or r.status_code not in (200, 202):
+        raise RuntimeError(f"Run export failed: HTTP {getattr(r,'status_code',None)} {getattr(r,'text','')[:300]}")
+
+
+def _month_iter(start: date, end: date):
+    """Yield (month_start_date, month_end_date) inclusive for each calendar month in range."""
+    cur = date(start.year, start.month, 1)
+    terminal = date(end.year, end.month, 1)
+    while cur <= terminal:
+        if cur.month == 12:
+            nxt = date(cur.year + 1, 1, 1)
+        else:
+            nxt = date(cur.year, cur.month + 1, 1)
+        last = nxt - timedelta(days=1)
+        yield cur, last
+        cur = nxt
+
+
+def _parse_ym(s: str) -> date:
+    """Accept YYYY-MM or YYYY-MM-DD; return normalized first-of-month date."""
+    s = (s or '').strip()
+    fmts = ["%Y-%m", "%Y-%m-%d"]
+    for f in fmts:
+        try:
+            d = datetime.strptime(s, f).date()
+            return date(d.year, d.month, 1)
+        except Exception:
+            continue
+    raise ValueError(f"Invalid date format: {s} (expected YYYY-MM or YYYY-MM-DD)")
+
+
+def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
+                                  export_dest_resource_id: str,
+                                  storage_account_name: str,
+                                  containers: dict,
+                                  dataset_api_type: dict,
+                                  default_roots: dict,
+                                  start_month: str, end_month: str,
+                                  fmt_choice: str, compression_choice: str) -> None:
+    """Seed historical cost data by creating + running month-sliced Custom exports.
+
+    Folder structure: <root>/historical/<YYYY>/<MM>
+    Export name pattern: finlyt_hist_<dataset>_<yyyymm>
+    Creates/updates export definitions (idempotent) then immediately triggers a run.
+    """
+    try:
+        start = _parse_ym(start_month)
+        end = _parse_ym(end_month)
+    except ValueError as ex:
+        print(f" Historical seeding skipped: {ex}")
+        return
+    if end < start:
+        print(" Historical seeding skipped: end before start.")
+        return
+
+    monthly_container = containers.get('monthly') or 'monthly'
+    # Derive effective compression (reuse logic from interactive flow)
+    def _effective(fmt: str, comp: str | None):
+        if not comp or comp == 'None':
+            return None
+        if fmt == 'Csv' and comp == 'Snappy':
+            return 'Gzip'
+        if fmt == 'Parquet' and comp == 'Gzip':
+            return 'Snappy'
+        return comp
+    base_comp = _effective(fmt_choice, compression_choice)
+
+    print("\n[historical] Seeding months from", start.strftime('%Y-%m'), "to", end.strftime('%Y-%m'))
+
+    # Overlap detection (blob-based) to prompt user
+    try:
+        blob_client = BlobServiceClient(f"https://{storage_account_name}.blob.core.windows.net", credential=cred)
+    except Exception:
+        blob_client = None
+
+    def _month_code(d: date) -> str:
+        return d.strftime('%Y%m')
+
+    requested_months = []
+    cur_chk = start
+    while cur_chk <= end:
+        requested_months.append(_month_code(cur_chk))
+        if cur_chk.month == 12:
+            cur_chk = date(cur_chk.year+1,1,1)
+        else:
+            cur_chk = date(cur_chk.year,cur_chk.month+1,1)
+
+    existing_by_ds: dict[str,set[str]] = {ds:set() for ds in datasets}
+    if blob_client:
+        monthly_container = containers.get('monthly') or 'monthly'
+        for ds in datasets:
+            root_base = default_roots.get(ds, 'exports')
+            for code in requested_months:
+                y = code[:4]; m = code[4:]
+                prefix = f"{root_base.rstrip('/')}/historical/{y}/{m}/"
+                try:
+                    cont = blob_client.get_container_client(monthly_container)
+                    gen = cont.list_blobs(name_starts_with=prefix)
+                    if any(True for _ in gen):
+                        existing_by_ds[ds].add(code)
+                except Exception:
+                    pass
+
+    overlaps_exist = any(existing_by_ds[ds] for ds in datasets)
+    action = 's'
+    if overlaps_exist:
+        print("[historical] Existing data detected:")
+        for ds in datasets:
+            if existing_by_ds[ds]:
+                print(f"  {ds}: {', '.join(sorted(existing_by_ds[ds]))}")
+        while True:
+            action = input("Action for existing months? [S]kip / [O]verwrite / [C]ancel (default S): ").strip().lower() or 's'
+            if action in ('s','o','c'):
+                break
+        if action == 'c':
+            print("[historical] Cancelled.")
+            return
+
+    hist_overwrite = (action == 'o')
+
+    manifest_entries: list[dict] = []
+    manifest_start = datetime.utcnow().isoformat()
+    for ds in datasets:
+        api_type = dataset_api_type.get(ds, ds)
+        ds_fmt = 'Csv' if api_type.startswith('Reservation') else fmt_choice
+        ds_comp = None if ds_fmt == 'Csv' and api_type.startswith('Reservation') else base_comp
+        root_base = default_roots.get(ds, 'exports')
+        for m_start, m_end in _month_iter(start, end):
+            yyyymm = m_start.strftime('%Y%m')
+            export_name = f"finlyt_hist_{ds.lower()}_{yyyymm}"
+            root_path = f"{root_base.rstrip('/')}/historical/{m_start.year}/{m_start.strftime('%m')}"
+            body = build_export_body(
+                dataset=api_type,
+                recurrence="Monthly",  # schedule metadata required but not meaningful for custom slice
+                dest_resource_id=export_dest_resource_id,
+                container=monthly_container,
+                root=root_path,
+                fmt=ds_fmt,
+                timeframe="Custom",
+                from_date=f"{m_start.isoformat()}T00:00:00Z",
+                to_date=f"{m_end.isoformat()}T23:59:59Z",
+                compression=ds_comp,
+                overwrite=False
+            )
+            try:
+                create_or_update_export(cred, scope_id, export_name, body)
+                run_export(cred, scope_id, export_name)
+                print(f"  {ds} {yyyymm}: submitted -> container={monthly_container} path={root_path}")
+            except Exception as ex:
+                print(f"  WARN {ds} {yyyymm}: {ex}")
+            time.sleep(1.0)  # light pacing to reduce throttling risk
+    print("[historical] Historical export runs queued. Files appear as runs complete.")
 
 
 # ---------- Settings helpers ----------
@@ -822,6 +991,9 @@ def interactive_flow(cred, settings):
         datasets = [d for d in datasets if d != "Reservation"]
         print("  -> Skipping Reservation dataset (unsupported at this scope type).")
 
+    # Ask for simple path mode (flatten: rootFolderPath="")
+    simple_path_mode = _prompt("Simplify paths (store directly under container/<exportName>/...)? (y/N)", "N").lower().startswith('y')
+
     ds_recurrences = {
         "FOCUS": ["Daily","Monthly"],
         "ActualCost": ["Daily","Monthly"],
@@ -839,6 +1011,9 @@ def interactive_flow(cred, settings):
         'FOCUS':'daily','ActualCost':'daily','AmortizedCost':'daily','Usage':'daily','Reservation':'reservation'}
     default_roots = {
         'FOCUS':'exports/focus','ActualCost':'exports/actual','AmortizedCost':'exports/amortized','Usage':'exports/usage','Reservation':'exports/reservation'}
+    if simple_path_mode:
+        # Flatten: scheduled + historical share the same (empty) root.
+        default_roots = {k: '' for k in default_roots}
 
     # Scope-aware timeframe mapping
     tf_map = get_timeframes_for_scope(scope_id)
@@ -925,14 +1100,25 @@ def interactive_flow(cred, settings):
                 else:
                     effective_compression = (None if compression == "None" else compression)
             timeframe = tf_map[recurrence]
-            name = f"finlyt_{ds.lower()}_{recurrence.lower()}"
+            if simple_path_mode:
+                # Deterministic shorter export names (unique per dataset+recurrence)
+                short_map = {'ActualCost':'actual','AmortizedCost':'amort','Usage':'usage','FOCUS':'focus','Reservation':'reservation'}
+                name = f"{recurrence.lower()}_{short_map.get(ds, ds.lower())}" if len(datasets) > 1 else recurrence.lower()
+            else:
+                name = f"finlyt_{ds.lower()}_{recurrence.lower()}"
+            # In simple path mode the API rejects an empty rootFolderPath. Use the export
+            # name itself as the root so files land under container/<exportName>/...
+            root_path = default_roots.get(ds,'exports')
+            if simple_path_mode:
+                root_path = name
             body = build_export_body(
                 dataset=export_type, recurrence=recurrence,
                 dest_resource_id=export_dest_resource_id,
-                container=container_name, root=default_roots.get(ds,'exports'),
+                container=container_name, root=root_path,
                 fmt=fmt, timeframe=timeframe,
                 compression=effective_compression,
-                overwrite=overwrite
+                overwrite=overwrite,
+                schedule_status='Active'
             )
             try:
                 create_or_update_export(cred, scope_id, name, body)
@@ -940,6 +1126,182 @@ def interactive_flow(cred, settings):
             except RuntimeError as ex:
                 print(f"  WARN: Failed to create {name} ({ds} | {recurrence}): {ex}")
                 continue
+
+    # Offer optional historical seeding
+    if _prompt("\nSeed historical cost data for selected datasets? (y/N)", "N").lower().startswith('y'):
+        elig = [d for d in datasets if d in ("FOCUS","ActualCost","AmortizedCost","Usage")]
+        if not elig:
+            print(" No eligible datasets selected for historical seeding.")
+        else:
+            print(" Historical seeding creates one export per month in the range provided.")
+            start_m = _prompt(" Start month (YYYY-MM)")
+            end_m = _prompt(" End month (YYYY-MM)")
+            try:
+                if simple_path_mode:
+                    # Reuse existing monthly export definitions (or create if missing) and run with Custom timeframe per month.
+                    for ds in elig:
+                        export_type = dataset_api_type.get(ds, ds)
+                        container_name = containers.get('monthly','monthly')
+                        ensure_container(cred, meta['storage_account_name'], container_name)
+                        # Determine export name used for scheduled monthly export for this dataset
+                        if simple_path_mode:
+                            short_map = {'ActualCost':'actual','AmortizedCost':'amort','Usage':'usage','FOCUS':'focus'}
+                            sched_name = f"monthly_{short_map.get(ds, ds.lower())}" if len(datasets) > 1 else 'monthly'
+                        else:
+                            sched_name = f"finlyt_{ds.lower()}_monthly"
+                        start = _parse_ym(start_m)
+                        end = _parse_ym(end_m)
+                        if end < start:
+                            print("  Skipped (end before start).")
+                            continue
+                        cur = start
+                        print(f"  Seeding {ds} via export '{sched_name}' -> container={container_name}")
+                        # Determine original timeframe for scheduled monthly export (should be TheLastMonth or mapping)
+                        original_timeframe = get_timeframes_for_scope(scope_id).get('Monthly','TheLastMonth')
+                        # Build a base definition to ensure the export exists (Active schedule for ongoing)
+                        # We create/update once here before month loop if it doesn't exist
+                        try:
+                            # Create/update scheduled form first (active)
+                            ensure_sched_body = build_export_body(
+                                dataset=export_type, recurrence='Monthly',
+                                dest_resource_id=export_dest_resource_id,
+                                container=container_name, root=(sched_name if simple_path_mode else default_roots.get(ds,'')),
+                                fmt=('Csv' if export_type.startswith('Reservation') else fmt_choice),
+                                timeframe=original_timeframe,
+                                compression=None if export_type.startswith('Reservation') else (None if compression=='None' else compression),
+                                overwrite=False,
+                                schedule_status='Active'
+                            )
+                            create_or_update_export(cred, scope_id, sched_name, ensure_sched_body)
+                        except Exception:
+                            pass
+
+                        # Overlap detection (blob) for existing months under this export root
+                        existing_months: set[str] = set()
+                        try:
+                            blob_client = BlobServiceClient(f"https://{meta['storage_account_name']}.blob.core.windows.net", credential=cred)
+                            cont = blob_client.get_container_client(container_name)
+                            # For simple path mode root == sched_name
+                            root_prefix = f"{sched_name}/" if simple_path_mode else f"{default_roots.get(ds,'')}/historical/"
+                            scan_cur = start
+                            while scan_cur <= end:
+                                code = scan_cur.strftime('%Y%m')
+                                if simple_path_mode:
+                                    # Files for custom monthly run will land under sched_name/<files>
+                                    # Can't easily isolate per-month folders; rely on export re-run detection minimalism
+                                    pass
+                                else:
+                                    y = scan_cur.strftime('%Y'); m = scan_cur.strftime('%m')
+                                    pre = f"{root_prefix}{y}/{m}/"
+                                    try:
+                                        if any(True for _ in cont.list_blobs(name_starts_with=pre)):
+                                            existing_months.add(code)
+                                    except Exception:
+                                        pass
+                                if scan_cur.month == 12:
+                                    scan_cur = date(scan_cur.year+1,1,1)
+                                else:
+                                    scan_cur = date(scan_cur.year,scan_cur.month+1,1)
+                        except Exception:
+                            pass
+
+                        # For simple path mode we cannot precisely detect per-month existing data without schema; treat all as new.
+                        action = 's'
+                        if existing_months:
+                            print(f"    Existing data detected for {ds}: {', '.join(sorted(existing_months))}")
+                            while True:
+                                action = _prompt("    Action? [S]kip existing / [O]verwrite / [C]ancel", 'S').lower() or 's'
+                                if action in ('s','o','c'):
+                                    break
+                            if action == 'c':
+                                print("    Cancelled dataset seeding.")
+                                continue
+                        overwrite_months = (action == 'o')
+
+                        manifest_entries = []
+                        manifest_start = datetime.now(UTC).isoformat()
+                        while cur <= end:
+                            # Month boundaries
+                            if cur.month == 12:
+                                nxt = date(cur.year+1,1,1)
+                            else:
+                                nxt = date(cur.year,cur.month+1,1)
+                            last = nxt - timedelta(days=1)
+                            dr_from = f"{cur.isoformat()}T00:00:00Z"
+                            dr_to = f"{last.isoformat()}T23:59:59Z"
+                            fmt_eff = 'Csv' if export_type.startswith('Reservation') else fmt_choice
+                            # Build custom body (root remains flattened or standard per simple_path_mode already)
+                            body = build_export_body(
+                                dataset=export_type, recurrence='Monthly',
+                                dest_resource_id=export_dest_resource_id,
+                                # Use export name as root in simple path mode to satisfy API (no empty root allowed)
+                                container=container_name, root=(sched_name if simple_path_mode else default_roots.get(ds,'')),
+                                fmt=fmt_eff, timeframe='Custom',
+                                from_date=dr_from, to_date=dr_to,
+                                compression=None if fmt_eff=='Csv' else (compression if compression not in ('None','none') else None),
+                                overwrite=overwrite_months,
+                                schedule_status='Inactive'
+                            )
+                            try:
+                                create_or_update_export(cred, scope_id, sched_name, body)
+                                run_export(cred, scope_id, sched_name)
+                                print(f"    {ds} {cur.strftime('%Y%m')} submitted")
+                                manifest_entries.append({"dataset":ds,"month":cur.strftime('%Y%m'),"action":"submitted","export":sched_name,"overwrite":overwrite_months})
+                            except Exception as ex:
+                                print(f"    WARN {ds} {cur.strftime('%Y%m')}: {ex}")
+                                manifest_entries.append({"dataset":ds,"month":cur.strftime('%Y%m'),"action":"error","error":str(ex)})
+                            time.sleep(0.5)
+                            cur = nxt
+                        # Restore original scheduled monthly definition (Active timeframe)
+                        try:
+                            restore_body = build_export_body(
+                                dataset=export_type, recurrence='Monthly',
+                                dest_resource_id=export_dest_resource_id,
+                                container=container_name, root=(sched_name if simple_path_mode else default_roots.get(ds,'')),
+                                fmt=('Csv' if export_type.startswith('Reservation') else fmt_choice),
+                                timeframe=original_timeframe,
+                                compression=None if export_type.startswith('Reservation') else (None if compression=='None' else compression),
+                                overwrite=False,
+                                schedule_status='Active'
+                            )
+                            create_or_update_export(cred, scope_id, sched_name, restore_body)
+                        except Exception as ex:
+                            print(f"    WARN: Failed to restore schedule for {sched_name}: {ex}")
+                        # Write manifest per dataset
+                        try:
+                            manifest = {
+                                "type":"historical-seeding",
+                                "mode":"simple-path-reuse",
+                                "scope": scope_id,
+                                "dataset": ds,
+                                "export": sched_name,
+                                "started": manifest_start,
+                                "ended": datetime.now(UTC).isoformat(),
+                                "entries": manifest_entries
+                            }
+                            mf_name = f"historical_seed_manifest_{ds.lower()}_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json"
+                            with open(mf_name,'w') as mf:
+                                json.dump(manifest,mf,indent=2)
+                            print(f"    Manifest written -> {mf_name}")
+                        except Exception as mex:
+                            print(f"    WARN: Failed to write manifest: {mex}")
+                else:
+                    seed_historical_cost_datasets(
+                        cred,
+                        scope_id,
+                        elig,
+                        export_dest_resource_id=export_dest_resource_id,
+                        storage_account_name=meta['storage_account_name'],
+                        containers=containers,
+                        dataset_api_type=dataset_api_type,
+                        default_roots=default_roots,
+                        start_month=start_m,
+                        end_month=end_m,
+                        fmt_choice=fmt_choice,
+                        compression_choice=compression
+                    )
+            except Exception as ex:
+                print(f" Historical seeding failed: {ex}")
 
     print("\nDone.")
 
@@ -1077,14 +1439,15 @@ def main():
             export_dest_resource_id = (f"/subscriptions/{args.dest_subscription_id}/resourceGroups/{args.dest_rg}"
                                        f"/providers/Microsoft.Storage/storageAccounts/{args.dest_sa}")
 
-    # Build export body and create/update
+    # Build export body and create/update (non-interactive single export path)
     export_body = build_export_body(
         dataset=args.dataset, recurrence=args.recurrence,
         dest_resource_id=export_dest_resource_id, container=dest_container, root=dest_root,
         fmt=args.format, timeframe=args.timeframe,
         from_date=args.from_date, to_date=args.to_date,
         compression=(None if (args.compression in (None, "None")) else args.compression),
-        overwrite=args.overwrite
+        overwrite=args.overwrite,
+        schedule_status='Active'
     )
     result = create_or_update_export(cred, scope_id, args.export_name, export_body)
 
@@ -1098,10 +1461,12 @@ def main():
         },
         "result": result
     }, indent=2))
+    return 0
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
-        main()
+        rc = main()
+        sys.exit(rc if isinstance(rc, int) else 0)
     except KeyboardInterrupt:
         print("\nCancelled.")
         sys.exit(1)

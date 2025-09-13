@@ -696,6 +696,59 @@ def enrich_hub_and_exports(cred, detected: List[Dict[str, Any]]) -> Optional[Dic
         full = get_export_with_history(cred, scope_sub, ename) if ename else None
         exports.append(summarize_export(full or e))
     hub["exports"] = exports
+
+    # Historical month presence scan (best-effort) for standard datasets under inferred roots
+    # Only attempt if we have blob access; results inform setup script to skip duplicates.
+    dataset_roots = {
+        'focus': 'exports/focus/historical',
+        'actualcost': 'exports/actual/historical',
+        'amortizedcost': 'exports/amortized/historical',
+        'usage': 'exports/usage/historical'
+    }
+    hist_summary: Dict[str, Any] = {}
+    try:
+        bsc = BlobServiceClient(f"https://{hub['account_name']}.blob.core.windows.net", credential=cred)
+        # Collect distinct containers from existing exports to refine search
+        exp_containers = {e.get('destination_container') for e in exports if e.get('destination_container')}
+        if not exp_containers:
+            # Fallback to common container names
+            exp_containers = {'cost','daily','monthly'}
+        for ds_key, base_root in dataset_roots.items():
+            months_found: Set[str] = set()
+            for cont in exp_containers:
+                try:
+                    cc = bsc.get_container_client(cont)
+                    # List blobs with delimiter to fetch pseudo-folders: base_root/YYYY/MM/
+                    # We'll list up to a cap per dataset to avoid excessive traversal.
+                    max_list = 500
+                    blob_iter = cc.list_blobs(name_starts_with=base_root + '/', results_per_page=200)
+                    count = 0
+                    for b in blob_iter:
+                        count += 1
+                        if count > max_list:
+                            break
+                        name = getattr(b, 'name', '')
+                        # Expect pattern base_root/YYYY/MM/...
+                        parts = name.split('/')
+                        # parts: [exports, focus, historical, YYYY, MM, ...]
+                        if len(parts) >= 5 and parts[-1]:
+                            try:
+                                idx = parts.index('historical')
+                            except ValueError:
+                                continue
+                            if idx+2 < len(parts):
+                                yyyy = parts[idx+1]
+                                mm = parts[idx+2]
+                                if len(yyyy) == 4 and len(mm) == 2 and yyyy.isdigit() and mm.isdigit():
+                                    months_found.add(yyyy+mm)
+                    if months_found:
+                        hist_summary[ds_key] = sorted(months_found)
+                except Exception:
+                    continue
+        if hist_summary:
+            hub['historical'] = {'months': hist_summary}
+    except Exception:
+        pass
     hub["status"] = {"healthy": bool(exports), "issues": [] if exports else ["No Cost Management exports found at subscription scope"]}
     return hub
 
