@@ -16,7 +16,6 @@ RUN pip install nuitka
 # Copy CLI scripts
 COPY 01_detect_finlythub.py ./
 COPY 02_deploy_finlythub.py ./
-COPY common_auth.py ./
 COPY config.py ./
 
 # Compile scripts to standalone binaries

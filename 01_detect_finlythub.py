@@ -34,6 +34,10 @@ from azure.storage.blob import BlobServiceClient
 
 import config
 SETTINGS_FILE = os.getenv("SETTINGS_FILE") or config.SETTINGS_FILE
+# New split settings file paths (env overrides handled in config)
+USER_SETTINGS_FILE = config.USER_SETTINGS_FILE
+FINLYT_SETTINGS_FILE = config.FINLYT_SETTINGS_FILE
+CM_EXPORT_SETTINGS_FILE = config.CM_EXPORT_SETTINGS_FILE
 
 # provide a UTC tzinfo instance for existing code that uses 'UTC'
 UTC = timezone.utc
@@ -206,6 +210,18 @@ def detect_finlythub_resources(cred) -> List[Dict[str, Any]]:
         try:
             rm = ResourceManagementClient(cred, sub_id)
             for rg in rm.resource_groups.list():
+                # Include tagged resource group itself
+                rg_tags = getattr(rg, 'tags', {}) or {}
+                if rg_tags.get(TAG_APPLICATION) == APPLICATION_VALUE:
+                    detections.append({
+                        "name": rg.name,
+                        "type": "Microsoft.Resources/resourceGroups",
+                        "id": rg.id,
+                        "location": getattr(rg, 'location', None),
+                        "resource_group": rg.name,
+                        "subscription_id": sub_id,
+                        "tags": rg_tags
+                    })
                 for res in rm.resources.list_by_resource_group(rg.name):
                     tags = res.tags or {}
                     if tags.get(TAG_APPLICATION) == APPLICATION_VALUE:
@@ -825,6 +841,45 @@ def main():
     print("Enriching hub and exports metadata (if detected)...")
     hub = enrich_hub_and_exports(cred, detected)
 
+    # Build comprehensive tagged resource inventories (multi-hub / multi-sub) for finlyt_settings extension
+    def _strip_mode(tags: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        if not tags:
+            return tags
+        if 'Mode' in tags:
+            tags = {k: v for k, v in tags.items() if k != 'Mode'}
+        return tags
+
+    tagged_storage = []
+    tagged_mi = []
+    tagged_rgs = []
+    subs_with_tag: Dict[str, Dict[str, Any]] = {}
+    for item in detected:
+        itype = (item.get('type') or '').lower()
+        sub_id = item.get('subscription_id')
+        subs_with_tag.setdefault(sub_id, {"id": sub_id})
+        base = {
+            'id': item.get('id'),
+            'name': item.get('name'),
+            'location': item.get('location'),
+            'subscription_id': sub_id,
+            'resource_group': item.get('resource_group'),
+            'tags': _strip_mode(item.get('tags'))
+        }
+        if itype == 'microsoft.storage/storageaccounts':
+            tagged_storage.append(base)
+        elif 'userassignedidentities' in itype:
+            tagged_mi.append(base)
+        elif itype == 'microsoft.resources/resourcegroups':
+            tagged_rgs.append(base)
+
+    # Augment subscription entries with name from subscriptions_results
+    for sres in subscriptions_results:
+        sid = sres.get('summary', {}).get('id')
+        if sid in subs_with_tag:
+            subs_with_tag[sid]['name'] = sres.get('summary', {}).get('name')
+            subs_with_tag[sid]['roles_seen'] = sres.get('summary', {}).get('roles_seen')
+            subs_with_tag[sid]['eligible_for_export'] = sres.get('summary', {}).get('eligible_for_export')
+
     # construct settings payload matching previous schema
     sub_for_user_summary = None
     if hub and hub.get("subscription_id"):
@@ -1170,10 +1225,78 @@ def main():
         "eligible_for_export": eligible_for_export,
     }
 
-    atomic_write_settings(SETTINGS_FILE, settings)
-    print(f"Detected {len(detected)} FinlytHub resource(s).")
-    print(f"Preflight completed for {len(all_subs)} subscription(s).")
-    print(f"settings.json -> {SETTINGS_FILE}")
+    # ---------------- Split settings construction ----------------
+    try:
+        user_settings = {
+            "observed": datetime.now(UTC).isoformat() + "Z",
+            "identity": {"object_id": oid or None},
+            "permissions": settings.get("user", {}).get("permissions"),
+            "assignments": settings.get("user", {}).get("permissions", {}).get("assignments"),
+            "roles_seen": settings.get("user", {}).get("permissions", {}).get("roles_seen"),
+            "billing": settings.get("billing")
+        }
+
+        # Sanitize existing single-resource tags
+        sub_single = settings.get("finlyt", {}).get("subscription") or {}
+        if isinstance(sub_single.get('tags'), dict):
+            sub_single['tags'] = _strip_mode(sub_single.get('tags'))
+        rg_single = settings.get("finlyt", {}).get("resource_group") or {}
+        if isinstance(rg_single.get('tags'), dict):
+            rg_single['tags'] = _strip_mode(rg_single.get('tags'))
+        sa_single = settings.get("finlyt", {}).get("Storage_account") or {}
+        if isinstance(sa_single.get('tags'), dict):
+            sa_single['tags'] = _strip_mode(sa_single.get('tags'))
+        mi_single = settings.get("finlyt", {}).get("managed_identities") or {}
+        if isinstance(mi_single.get('tags'), dict):
+            mi_single['tags'] = _strip_mode(mi_single.get('tags'))
+
+        finlyt_settings = {
+            "observed": datetime.now(UTC).isoformat() + "Z",
+            "subscription": sub_single,
+            "resource_group": rg_single,
+            "storage_account": sa_single,
+            "managed_identities": mi_single,
+            "exports_running": settings.get("finlyt", {}).get("cm_exports", {}).get("running"),
+            "historical": ((settings.get("finlyt", {}) or {}).get("historical")) or None,
+            "tagged": {
+                "subscriptions": list(subs_with_tag.values()),
+                "resource_groups": tagged_rgs,
+                "storage_accounts": tagged_storage,
+                "managed_identities": tagged_mi
+            }
+        }
+
+        cm_export_settings = {
+            "observed": datetime.now(UTC).isoformat() + "Z",
+            "finlyt": settings.get("finlyt", {}).get("cost_mgmt"),
+            "nonfinlyt": settings.get("nonfinlyt", {}).get("cost_mgmt"),
+            "exports": {
+                "finlyt": settings.get("finlyt", {}).get("cm_exports", {}).get("running"),
+                "nonfinlyt": settings.get("nonfinlyt", {}).get("cm_exports", {}).get("running"),
+            }
+        }
+
+        # Defensive stripping of empty values (optional, keep structure minimal)
+        def _strip_empty(d):
+            if not isinstance(d, dict):
+                return d
+            return {k: v for k, v in d.items() if v not in (None, [], {}, "")}
+
+        user_settings = _strip_empty(user_settings)
+        finlyt_settings = _strip_empty(finlyt_settings)
+        cm_export_settings = _strip_empty(cm_export_settings)
+
+        atomic_write_settings(USER_SETTINGS_FILE, user_settings)
+        atomic_write_settings(FINLYT_SETTINGS_FILE, finlyt_settings)
+        atomic_write_settings(CM_EXPORT_SETTINGS_FILE, cm_export_settings)
+        print(f"[Finlyt][detect] user_settings -> {USER_SETTINGS_FILE}")
+        print(f"[Finlyt][detect] finlyt_settings -> {FINLYT_SETTINGS_FILE}")
+        print(f"[Finlyt][detect] cm_export_settings -> {CM_EXPORT_SETTINGS_FILE}")
+    except Exception as e:
+        print(f"[Finlyt][warn] Failed to write split settings files: {e}")
+
+    # Legacy consolidated write removed (split settings only moving forward)
+    print(f"Detected {len(detected)} FinlytHub resource(s). Preflight across {len(all_subs)} subscription(s).")
 
 
 if __name__ == "__main__":

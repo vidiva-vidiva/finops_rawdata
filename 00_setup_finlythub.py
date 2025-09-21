@@ -40,17 +40,17 @@ from datetime import datetime, date, timedelta
 import re
 import requests
 
-SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(os.path.dirname(__file__), "settings.json"))
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(os.path.dirname(__file__), "settings.json"))  # legacy read-only
+from settings_io import load_aggregated, update_recommended_scope, update_destination
 
 
 # ----------------------- Helpers -----------------------
 def _log(msg: str):
-    print(f"[orchestrator] {msg}")
+    print(f"[Finlyt] {msg}")
 
 
-def load_settings(path: str) -> Dict[str, Any]:
-    with open(path, "r") as f:
-        return json.load(f)
+def load_combined_settings() -> Dict[str, Any]:
+    return load_aggregated()
 
 
 def run_detection(python_exe: str = sys.executable, force: bool = False) -> bool:
@@ -65,27 +65,47 @@ def run_detection(python_exe: str = sys.executable, force: bool = False) -> bool
     if proc.returncode != 0:
         # Testing fallback when azure SDK not present and FINLYT_TEST_MODE=1
         if os.getenv("FINLYT_TEST_MODE") == "1" and "ModuleNotFoundError" in (proc.stderr + proc.stdout):
-            _log("Azure SDK missing; creating minimal test settings.json fallback.")
-            minimal = {
-                "finlyt": {
-                    "subscription": {"id": None, "location": "eastus"},
-                    "resource_group": {"name": None},
-                    "Storage_account": {"id": None},
-                    "cost_mgmt": {
-                        "can_setup_exports": {"eligible_for_export": True},
-                        "recommended_export_scope": {"id": "/subscriptions/00000000-0000-0000-0000-000000000000"},
-                        "recommended_destination": {"resource_id": None, "container": "cost", "root_path": "exports/focus"}
-                    },
-                    "cm_exports": {"running": []}
-                }
+            _log("Azure SDK missing; creating minimal split settings fallback (legacy write suppressed).")
+            # Construct minimal split settings shapes
+            from datetime import datetime
+            now_iso = datetime.utcnow().isoformat() + 'Z'
+            user_settings = {"observed": now_iso, "permissions": {}}
+            finlyt_settings = {
+                "observed": now_iso,
+                "subscription": {"id": None, "location": "eastus"},
+                "resource_group": {"name": None},
+                "storage_account": {"id": None},
+                "managed_identities": {},
+                "exports_running": []
             }
+            cm_export_settings = {
+                "observed": now_iso,
+                "finlyt": {
+                    "can_setup_exports": {"eligible_for_export": True},
+                    "recommended_export_scope": {"id": "/subscriptions/00000000-0000-0000-0000-000000000000"},
+                    "recommended_destination": {"resource_id": None, "container": "cost", "root_path": "exports/focus"}
+                },
+                "nonfinlyt": {},
+                "exports": {"finlyt": []}
+            }
+            # Local atomic writer
+            def _aw(path, obj):
+                try:
+                    tmp = path + '.tmp'
+                    with open(tmp,'w') as f:
+                        json.dump(obj,f,indent=2)
+                    os.replace(tmp,path)
+                except Exception as ex:
+                    _log(f"Failed to write {path}: {ex}")
             try:
-                with open(SETTINGS_FILE, 'w') as f:
-                    json.dump(minimal, f, indent=2)
-                _log("Wrote minimal test settings.")
+                base_dir = os.path.dirname(__file__)
+                _aw(os.getenv("USER_SETTINGS_FILE", os.path.join(base_dir, "user_settings.json")), user_settings)
+                _aw(os.getenv("FINLYT_SETTINGS_FILE", os.path.join(base_dir, "finlyt_settings.json")), finlyt_settings)
+                _aw(os.getenv("CM_EXPORT_SETTINGS_FILE", os.path.join(base_dir, "cm_export_settings.json")), cm_export_settings)
+                _log("Wrote minimal split settings (test mode).")
                 return True
             except Exception as e:
-                _log(f"Failed to write minimal settings: {e}")
+                _log(f"Failed to write minimal split settings: {e}")
                 return False
         _log("Detection failed:")
         sys.stderr.write(proc.stdout + proc.stderr)
@@ -127,69 +147,17 @@ def analyze_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_deploy_command(analysis: Dict[str, Any], args) -> Optional[list[str]]:
-    """Return the command list to invoke deploy (02) or None if no-op."""
-    # If interactive requested, ignore auto logic
-    if args.deploy_interactive:
-        return [sys.executable, '02_deploy_finlythub.py', '--interactive', '--settings', SETTINGS_FILE]
-
-    # Auto logic
-    need_infra = not analysis['hub_present']
-    need_focus_export = (not analysis['focus_export_exists']) or args.force_deploy
-
-    if not need_infra and not need_focus_export:
-        return None  # no action
-
-    export_name = args.export_name or 'finlyt_focus_daily'
-    scope_id = args.scope_id or analysis['recommended_scope_id']
-    if not scope_id:
-        # If we lack a recommended scope but have a subscription id, fallback to subscription scope
-        sub_id = analysis['settings_subscription_id']
-        if sub_id:
-            scope_id = f"/subscriptions/{sub_id}"
-    if not scope_id:
-        raise RuntimeError('Unable to determine export scope id (supply --scope-id).')
-
-    cmd = [sys.executable, '02_deploy_finlythub.py', '--settings', SETTINGS_FILE,
-           '--export-name', export_name, '--dataset', 'FOCUS', '--recurrence', 'Daily', '--timeframe', 'MTD', '--format', 'Parquet']
-
-    if need_infra:
-        # Need to deploy hub infra via Bicep.
-        sub_id = args.dest_subscription_id or analysis['settings_subscription_id']
-        if not sub_id:
-            raise RuntimeError('No subscription id available for infra deployment (pass --dest-subscription-id).')
-        rg_name = args.dest_rg or analysis['settings_rg_name']
-        if not rg_name:
-            # Derive deterministic RG if missing
-            rg_name = f"rg-finlythub-{sub_id[:8]}"
-        location = args.dest_location or analysis['settings_location']
-        cmd.extend(['--use-bicep', '--dest-subscription-id', sub_id, '--dest-rg', rg_name, '--dest-location', location])
-    else:
-        # Existing hub; pass destination pieces only if user overrides; else rely on settings inference inside deploy script.
-        if args.dest_subscription_id:  # user explicit override
-            cmd.extend(['--dest-subscription-id', args.dest_subscription_id])
-        if args.dest_rg:
-            cmd.extend(['--dest-rg', args.dest_rg])
-        if args.dest_sa:
-            cmd.extend(['--dest-sa', args.dest_sa])
-        if args.dest_container:
-            cmd.extend(['--dest-container', args.dest_container])
-        if args.dest_root:
-            cmd.extend(['--dest-root', args.dest_root])
-
-    # Scope args (explicit scope-id wins)
-    cmd.extend(['--scope-id', scope_id])
-
-    if args.extra_deploy_args:
-        # naive split; users can quote if needed
-        cmd.extend(args.extra_deploy_args.split())
-    return cmd
+# build_deploy_command removed: non-interactive automation pruned
 
 
 # ----------------------- Interactive Enhancements -----------------------
+EXIT_TOKENS = {"q","quit","exit","x"}
+
 def _prompt(msg: str, default: Optional[str] = None, allow_empty: bool = True) -> str:
     while True:
         raw = input(f"{msg}{' ['+default+']' if default else ''}: ").strip()
+        if raw.lower() in EXIT_TOKENS:
+            return "__EXIT__"
         if not raw and default is not None:
             raw = default
         if raw or allow_empty:
@@ -198,11 +166,13 @@ def _prompt(msg: str, default: Optional[str] = None, allow_empty: bool = True) -
 
 
 def _menu(title: str, options: List[str]) -> int:
-    print(f"\n{title}")
+    print(f"\n{title} (type q to exit)")
     for i,o in enumerate(options,1):
         print(f" {i}. {o}")
     while True:
         sel = input("Enter choice #: ").strip()
+        if sel.lower() in EXIT_TOKENS:
+            return -1
         if sel.isdigit():
             idx = int(sel)
             if 1 <= idx <= len(options):
@@ -211,12 +181,8 @@ def _menu(title: str, options: List[str]) -> int:
 
 
 def _save_settings(path: str, settings: Dict[str, Any]):
-    try:
-        with open(path,'w') as f:
-            json.dump(settings,f,indent=2)
-        _log(f"Settings updated -> {path}")
-    except Exception as ex:
-        _log(f"Failed to save settings: {ex}")
+    # Deprecated: legacy writes removed. Function retained for compatibility if invoked.
+    _log("[deprecated] Ignored legacy settings write (split settings only).")
 
 
 def _ensure_settings_struct(settings: Dict[str, Any]):
@@ -231,36 +197,7 @@ def _ensure_settings_struct(settings: Dict[str, Any]):
     return settings
 
 
-def interactive_first_time(set_path: str, python_exe: str, analysis: Dict[str,Any], args) -> None:
-    _log("First-time setup selected.")
-    # Run detection (force) if hub not present or settings minimal
-    if not analysis['hub_present'] or not os.path.exists(set_path):
-        if not run_detection(force=True):
-            _log("Detection failed; aborting first-time setup.")
-            return
-        try:
-            settings = load_settings(set_path)
-            analysis.update(analyze_settings(settings))
-        except Exception:
-            pass
-    # Build and run deploy command (focus daily) irrespective of eligibility when user confirms
-    confirm = _prompt("Proceed with deploying FinlytHub infra/FOCUS export now? (y/N)", "N").lower().startswith('y')
-    if not confirm:
-        _log("First-time setup aborted by user.")
-        return
-    class Dummy: pass
-    dummy = Dummy()
-    # mimic argparse Namespace for needed attributes
-    for k in ['deploy_interactive','force_deploy','dest_subscription_id','dest_rg','dest_location','dest_sa','dest_container','dest_root','export_name','scope_id','extra_deploy_args']:
-        setattr(dummy,k,getattr(args,k,None))
-    dummy.force_deploy = True  # ensure creation even if eligibility false
-    cmd = build_deploy_command(analysis, dummy)
-    if not cmd:
-        _log("Nothing to deploy (already present).")
-        return
-    _log('Executing: ' + ' '.join(cmd))
-    subprocess.run(cmd)
-    _log("First-time setup complete.")
+# interactive_first_time removed: always use interactive deploy script directly
 
 
 def interactive_change_scope(settings: Dict[str,Any], path: str):
@@ -273,7 +210,11 @@ def interactive_change_scope(settings: Dict[str,Any], path: str):
         print("No change.")
         return
     settings['finlyt']['cost_mgmt']['recommended_export_scope']['id'] = new_scope
-    _save_settings(path, settings)
+    try:
+        update_recommended_scope(new_scope)
+        _log("Updated recommended scope in split settings.")
+    except Exception as ex:
+        _log(f"Failed to update split scope: {ex}")
 
 
 def interactive_change_destination(settings: Dict[str,Any], path: str):
@@ -287,7 +228,11 @@ def interactive_change_destination(settings: Dict[str,Any], path: str):
     container = _prompt("Container name", cur_cont)
     root = _prompt("Root path (folder prefix)", cur_root)
     dest.update({'resource_id': rid, 'container': container, 'root_path': root})
-    _save_settings(path, settings)
+    try:
+        update_destination(rid, container, root)
+        _log("Updated destination in split settings.")
+    except Exception as ex:
+        _log(f"Failed to update destination: {ex}")
 
 
 def _month_iter(start: date, end: date):
@@ -594,7 +539,7 @@ def manage_menu(args):
     """Management actions for an existing installation."""
     while True:
         try:
-            settings = load_settings(SETTINGS_FILE)
+            settings = load_combined_settings()
         except Exception:
             settings = {}
         choice = _menu("Select a repair/management action", [
@@ -605,6 +550,9 @@ def manage_menu(args):
             "Cleanup (remove exports/resources)",
             "Exit"
         ])
+        if choice == -1 or choice == 5:
+            _log("Leaving repair menu.")
+            break
         if choice == 0:
             interactive_add_exports(sys.executable, SETTINGS_FILE)
         elif choice == 1:
@@ -615,30 +563,50 @@ def manage_menu(args):
             interactive_seed_historical(SETTINGS_FILE, settings)
         elif choice == 4:
             interactive_cleanup(sys.executable)
-        else:
-            _log("Leaving repair menu.")
-            break
 
+
+def _extract_sa_name(resource_id: Optional[str]) -> Optional[str]:
+    if not resource_id or not isinstance(resource_id,str):
+        return None
+    m = re.search(r"/storageAccounts/([^/]+)", resource_id, re.IGNORECASE)
+    return m.group(1) if m else None
+
+def _summarize_environment(analysis: Dict[str,Any]):
+    print("\n----- Finlyt Hub Detected -----")
+    print(f"Scope: {analysis.get('recommended_scope_id') or '-'}")
+    print(f"Subscription Id: {analysis.get('settings_subscription_id') or '-'}")
+    print(f"Resource Group: {analysis.get('settings_rg_name') or '-'}")
+    print(f"Location: {analysis.get('settings_location') or '-'}")
+    sa_name = _extract_sa_name(analysis.get('dest_resource_id')) if analysis.get('dest_resource_id') else '-'  # may be None
+    print(f"Storage Account: {sa_name or '-'}")
+    # Permissions / scope readiness summary
+    eligible = analysis.get('eligible_for_export')
+    if eligible:
+        print("CM Export Permission: User appears ELIGIBLE for scheduling exports")
+    else:
+        print("CM Export Permission: User NOT eligible (can_setup_exports.eligible_for_export=false)")
 
 def root_menu(args):
-    """Top-level menu presented when no flags supplied.
-    Options: Install Finlyt (first-time) or Repair Finlyt (manage existing).
-    Both paths force detection to refresh settings.json first."""
+    """Top-level menu (Install or Repair). Always uses interactive deploy for Install."""
     while True:
+        if sys.stdout.isatty():
+            hdr = "Finlyt Setup"
+            line = '=' * len(hdr)
+            print(f"\n\033[36m{line}\n{hdr}\n{line}\033[0m")
         choice = _menu("Finlyt Setup", [
-            "Install Finlyt (first-time setup)",
+            "Install Finlyt (interactive)",
             "Repair / Manage Finlyt",
             "Exit"
         ])
-        if choice == 2:
+        if choice == -1 or choice == 2:
             _log("Exit.")
             return
-        # Always refresh settings (force detection) before action
+        # Force detection every loop to ensure fresh state
         if not run_detection(force=True):
             _log("Detection failed; cannot continue.")
             return
         try:
-            settings = load_settings(SETTINGS_FILE)
+            settings = load_combined_settings()
         except Exception:
             settings = {}
         analysis = analyze_settings(settings) if settings else {
@@ -646,131 +614,36 @@ def root_menu(args):
             'recommended_scope_id': None,'dest_resource_id': None,'dest_container': 'cost',
             'settings_subscription_id': None,'settings_rg_name': None,'settings_location': 'eastus'
         }
-        if choice == 0:  # Install
-            _log('Current state (post-detection): ' + json.dumps({k:v for k,v in analysis.items() if k not in ('dest_resource_id',)}, indent=2))
-            # Allow user to choose interactive wizard vs quick (auto) install
-            if _prompt("Use interactive deployment wizard? (Y/n)", "Y").lower().startswith('y'):
-                # Delegate fully to deploy script interactive mode (handles infra + exports + historical prompt)
-                cmd = [sys.executable, '02_deploy_finlythub.py', '--interactive', '--settings', SETTINGS_FILE]
-                _log('Launching interactive deploy: ' + ' '.join(cmd))
-                rc = subprocess.call(cmd)
-                if rc != 0:
-                    _log(f'Interactive deploy failed (exit {rc}).')
-                else:
-                    _log('Interactive deploy completed.')
+        _summarize_environment(analysis)
+        if choice == 0:  # Always interactive deploy
+            cmd = [sys.executable, '02_deploy_finlythub.py', '--interactive', '--settings', SETTINGS_FILE]
+            _log('Launching interactive deploy: ' + ' '.join(cmd))
+            rc = subprocess.call(cmd)
+            if rc != 0:
+                _log(f'Interactive deploy failed (exit {rc}).')
             else:
-                _log('Proceeding with quick install (non-interactive).')
-                class Dummy: pass
-                dummy = Dummy()
-                for k in ['deploy_interactive','force_deploy','dest_subscription_id','dest_rg','dest_location','dest_sa','dest_container','dest_root','export_name','scope_id','extra_deploy_args']:
-                    setattr(dummy,k,getattr(args,k,None))
-                dummy.force_deploy = True
-                cmd = build_deploy_command(analysis, dummy)
-                if not cmd:
-                    _log('Finlyt appears already installed (hub + focus export).')
-                else:
-                    _log('Executing install: ' + ' '.join(cmd))
-                    rc = subprocess.call(cmd)
-                    if rc != 0:
-                        _log(f'Install deploy failed (exit {rc}).')
-                    else:
-                        _log('Install completed.')
+                _log('Interactive deploy completed.')
         elif choice == 1:  # Repair / Manage
-            _log('Entering repair / management menu.')
+            _log('Entering repair / management menu. (Press Ctrl+C to exit at any time)')
             manage_menu(args)
-        # Loop again after action to allow multiple operations
 
 
 
 def main():
-    global SETTINGS_FILE  # declare early so default usage below is valid
-    ap = argparse.ArgumentParser(description="Orchestrate FinlytHub detect + deploy/export flow.")
+    global SETTINGS_FILE
+    ap = argparse.ArgumentParser(description="FinlytHub interactive setup / management.")
     ap.add_argument('--settings', default=SETTINGS_FILE, help='Path to settings.json (default: repo root).')
-    ap.add_argument('--auto', action='store_true', help='Run detection (if needed) then auto deploy missing infra/export.')
-    ap.add_argument('--force-detect', action='store_true', help='Force re-run detection even if settings exists.')
-    ap.add_argument('--skip-detect', action='store_true', help='Skip detection phase (assume settings current).')
-    ap.add_argument('--force-deploy', action='store_true', help='Force deploy even if focus export already exists.')
-    ap.add_argument('--deploy-interactive', action='store_true', help='Enter deploy script interactive mode after detection.')
-    ap.add_argument('--cleanup', action='store_true', help='Run interactive cleanup (exports + tagged resources) after detection and skip deploy logic.')
-    ap.add_argument('--dry-run', action='store_true', help='Show actions without executing deploy.')
-    ap.add_argument('--export-name', help='Override export name (default finlyt_focus_daily)')
-    ap.add_argument('--scope-id', help='Override scope id (else use recommended or subscription).')
-    ap.add_argument('--extra-deploy-args', help='Additional raw args appended to deploy command.')
-    # Infra override options (useful when hub missing)
-    ap.add_argument('--dest-subscription-id')
-    ap.add_argument('--dest-rg')
-    ap.add_argument('--dest-location')
-    ap.add_argument('--dest-sa')
-    ap.add_argument('--dest-container')
-    ap.add_argument('--dest-root')
+    ap.add_argument('--cleanup', action='store_true', help='Launch cleanup directly and exit.')
     args = ap.parse_args()
-
-    # Rebind module-level SETTINGS_FILE to user-specified path (allowed)
     SETTINGS_FILE = args.settings
 
-    if args.auto or args.deploy_interactive or args.cleanup:
-        pass  # proceed with legacy flow
-    else:
-        # Root interactive menu (Install / Repair)
-        root_menu(args)
-        return 0
-
-    # 1. Detection (unless skipped)
-    if not args.skip_detect:
-        if not run_detection(force=args.force_detect):
-            return 2
-    else:
-        _log('Detection skipped by --skip-detect.')
-
-    if not os.path.exists(SETTINGS_FILE):
-        _log(f'Settings file not found after detection step: {SETTINGS_FILE}')
-        return 2
-
-    # 2. Analyze settings
-    try:
-        settings = load_settings(SETTINGS_FILE)
-    except Exception as e:
-        _log(f'Failed to read settings: {e}')
-        return 2
-    analysis = analyze_settings(settings)
-    _log('Analysis: ' + json.dumps({k: v for k, v in analysis.items() if k not in ('dest_resource_id',)}, indent=2))
-
-    # If not eligible and no hub present, abort unless user forces
-    if not analysis['eligible_for_export'] and not args.force_deploy and not args.deploy_interactive and not args.cleanup:
-        _log('Environment not eligible for export setup (can_setup_exports.eligible_for_export = false). Use --force-deploy to override.')
-        return 3
-
-    # Cleanup mode shortcut
     if args.cleanup:
         _log('Launching interactive cleanup (03_cleanup_finlythub.py)...')
-        import subprocess as _sp
-        rc2 = _sp.call([sys.executable, '03_cleanup_finlythub.py'])
-        return rc2
+        rc = subprocess.call([sys.executable, '03_cleanup_finlythub.py'])
+        return rc
 
-    # 3. Build deploy command
-    try:
-        deploy_cmd = build_deploy_command(analysis, args)
-    except Exception as e:
-        _log(f'Cannot build deploy command: {e}')
-        return 3
-
-    if not deploy_cmd:
-        _log('No deployment action required (infra + export already in place).')
-        return 0
-
-    _log('Planned deploy command: \n  ' + ' '.join(deploy_cmd))
-
-    if args.dry_run:
-        _log('--dry-run specified; exiting without execution.')
-        return 0
-
-    # 4. Execute deploy
-    _log('Executing deploy (02_deploy_finlythub.py)...')
-    proc = subprocess.run(deploy_cmd, text=True)
-    if proc.returncode != 0:
-        _log(f'Deploy command failed with exit code {proc.returncode}.')
-        return proc.returncode or 1
-    _log('Deploy/export phase complete.')
+    # Pure interactive menu flow
+    root_menu(args)
     return 0
 
 

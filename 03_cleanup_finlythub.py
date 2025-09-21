@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import re
+import shutil
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timezone
 
@@ -19,7 +20,10 @@ from finlyt_common import get_token, http_with_backoff
 EXPORTS_API = "2025-03-01"
 RESOURCE_API = "2022-09-01"
 MI_API = "2023-01-31"
+# Legacy settings file path retained only for read fallback (no further writes)
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
+
+from settings_io import load_aggregated as load_settings_aggregated, update_exports
 
 # Diagnostic / safety flags (override via env)
 SHOW_DEST_ID = os.getenv("FINLYT_SHOW_DEST", "0") == "1"  # include destination resourceId column
@@ -29,33 +33,36 @@ DEBUG_EXPORT = os.getenv("FINLYT_DEBUG", "0") == "1"  # verbose schedule debug
 
 
 # ------------- Helpers -------------
-def load_settings(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-    with open(path, 'r') as f:
-        try:
-            return json.load(f)
-        except Exception:
-            return {}
+def update_split_after_deletions(remaining_exports: List[Dict[str, Any]]):
+    # Reuse shared update_exports helper (overwrites running list)
+    update_exports(remaining_exports)
 
+EXIT_TOKENS = {"q","quit","exit","x"}
 
 def _prompt(msg: str, default: str | None = None) -> str:
+    """Prompt user; if they enter an exit token return a sentinel '__EXIT__'."""
     try:
         raw = input(f"{msg}{' ['+default+']' if default else ''}: ").strip()
-        return raw or (default or '')
     except EOFError:
         return default or ''
-
+    if raw.lower() in EXIT_TOKENS:
+        return "__EXIT__"
+    return raw or (default or '')
 
 def _yesno(msg: str, default: bool = False) -> bool:
     d = 'Y' if default else 'N'
     val = _prompt(f"{msg} (y/N)" if not default else f"{msg} (Y/n)", d)
+    if val == "__EXIT__":
+        raise KeyboardInterrupt()
     return val.lower().startswith('y')
 
 
 def _multiselect_indices(count: int, prompt: str, allow_empty: bool = True) -> List[int]:
     while True:
-        raw = _prompt(prompt).strip()
+        raw = _prompt(prompt)
+        if raw == "__EXIT__":
+            raise KeyboardInterrupt()
+        raw = raw.strip()
         if not raw and allow_empty:
             return []
         parts = [p.strip() for p in raw.split(',') if p.strip()]
@@ -73,22 +80,67 @@ def _pad(s: Any, width: int) -> str:
     return s[:width].ljust(width)
 
 
+def _terminal_width(default: int = 120) -> int:
+    try:
+        return shutil.get_terminal_size((default, 20)).columns
+    except Exception:
+        return default
+
+def _truncate(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    if max_len <= 3:
+        return value[:max_len]
+    return value[:max_len-1] + '…'
+
 def _print_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str]], title: str):
+    """Width-aware table printer with adaptive truncation to avoid ugly wrapping.
+    Strategy:
+      1. Compute natural width for each column.
+      2. If total exceeds terminal width, iteratively shrink widest flexible columns
+         (excluding first two) down to a floor (min 8 chars) until it fits.
+      3. Truncate cell values to final column widths.
+    """
     if not rows:
         print(f"\n{title}: (none found)")
         return
     print(f"\n{title}:")
-    # Compute widths
+    term_w = _terminal_width()
+    # Compute desired widths
     widths: Dict[str,int] = {}
     for key, header in columns:
-        widths[key] = max(len(header), *(len(str(r.get(key,''))) for r in rows))
-    # Row number column
+        cell_max = max(len(str(r.get(key,''))) for r in rows) if rows else 0
+        widths[key] = max(len(header), cell_max, 3)
     num_w = len(str(len(rows)))
-    header_line = _pad('#', num_w) + '  ' + '  '.join(_pad(h, widths[k]) for k,h in columns)
+    gap = 2
+    def total_width() -> int:
+        return num_w + 2 + sum(widths[k] for k,_ in columns) + gap*(len(columns)-1)
+    if total_width() > term_w:
+        # Flexible keys exclude very short columns and the row number
+        flex = [k for k,_ in columns]
+        floor = 8
+        # Repeatedly shrink the currently widest column until fits or all at floor
+        while total_width() > term_w and any(widths[k] > floor for k in flex):
+            # pick widest
+            k_widest = max(flex, key=lambda k: widths[k])
+            if widths[k_widest] <= floor:
+                # all at floor
+                break
+            widths[k_widest] -= 1
+    # Build header
+    header_line = _pad('#', num_w) + '  ' + '  '.join(_pad(h if len(h)<=widths[k] else _truncate(h,widths[k]), widths[k]) for k,h in columns)
+    if len(header_line) > term_w:  # Avoid wrapping header itself
+        header_line = header_line[:term_w-1] + '…'
     print(header_line)
-    print('-'*len(header_line))
+    print('-'*min(len(header_line), term_w))
     for i, r in enumerate(rows, 1):
-        line = _pad(i, num_w) + '  ' + '  '.join(_pad(r.get(k,''), widths[k]) for k,_ in columns)
+        cells = []
+        for k,_ in columns:
+            raw = '' if r.get(k) is None else str(r.get(k))
+            cells.append(_pad(_truncate(raw, widths[k]), widths[k]))
+        line = _pad(i, num_w) + '  ' + '  '.join(cells)
+        if len(line) > term_w:
+            line = line[:term_w-1] + '…'
         print(line)
 
 
@@ -278,10 +330,10 @@ def get_export_schedule_times(cred, scope_id: str, export_name: str) -> dict:
 
 
 def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
-    print("FinlytHub Cleanup Utility")
+    print("FinlytHub Cleanup Utility  (type 'q' or 'exit' anytime to abort)")
     print("This tool lists Cost Management exports and Azure resources tagged with Application=FinlytHub.")
     cred = DefaultAzureCredential()
-    settings = settings or load_settings(SETTINGS_FILE)
+    settings = settings or load_settings_aggregated()
     # ------- Scope discovery & selection (multi) -------
     default_scope = determine_default_scope(settings)
     candidates: List[str] = []
@@ -319,6 +371,9 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
             print(f"  {i}. {sc}")
         print("  *  (all)")
         sel_raw = _prompt("Select scopes to scan (e.g. 1,3 or * for all)", '*')
+        if sel_raw == "__EXIT__":
+            print("Exit requested.")
+            return
         if sel_raw.strip() == '*':
             scopes = deduped[:]
         else:
@@ -332,6 +387,9 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
             scopes = chosen
         # Allow adding extra scopes
         extra = _prompt("Enter additional scope IDs (comma separated) or blank to continue", '')
+        if extra == "__EXIT__":
+            print("Exit requested.")
+            return
         if extra:
             for s in [x.strip() for x in extra.split(',') if x.strip()]:
                 if s not in scopes:
@@ -436,8 +494,7 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         return (0 if dt else 1, -(dt.timestamp()) if dt else 0)
     all_export_rows.sort(key=_exp_sort_key)
 
-    # Rebuild index map after sorting to align with visual order
-    export_index_map = [(r['scope'], r['name']) for r in all_export_rows]
+    # (Removed unused export_index_map; direct indexing of all_export_rows is used below.)
 
     export_columns = [
         ('name','Export Name'),
@@ -449,7 +506,7 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         ('nextRunTimeEstimate','nextRunTimeEstimate'),
         ('timeframe','Timeframe'),
         ('granularity','Granularity'),
-    ('DataOverwriteBehavior','DataOverwriteBehavior'),
+        ('DataOverwriteBehavior','DataOverwriteBehavior'),
         ('format','format'),
         ('compressionMode','compressionMode'),
         ('container','Container'),
@@ -461,7 +518,6 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
     # Tagged resources
     sub_id = ((settings.get('finlyt', {}) or {}).get('subscription', {}) or {}).get('id')
     tagged_rows: List[Dict[str, Any]] = []  # will be sorted
-    tagged_index_map: List[str] = []  # rebuilt after sort
     tagged_storage_names: set[str] = set()
     if sub_id:
         # Generic resources (excludes resource groups)
@@ -498,7 +554,7 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
         dt = _parse_dt(r.get('created'))
         return (0 if dt else 1, -(dt.timestamp()) if dt else 0)
     tagged_rows.sort(key=_res_sort_key)
-    tagged_index_map = [r['id'] for r in tagged_rows]
+    # (Removed unused tagged_index_map.)
 
     # Validate storage accounts referenced by exports (existence + tag presence)
     if VALIDATE_SA:
@@ -559,6 +615,23 @@ def interactive_cleanup(settings: Optional[Dict[str, Any]] = None):
                         sc, ename = r['scope'], r['name']
                         ok = delete_export(cred, sc, ename)
                         print(f" - {'Deleted' if ok else 'FAILED'} export {ename} (scope {sc})")
+                    # Recompute remaining exports list for settings update
+                    remaining = []
+                    for r in all_export_rows:
+                        if r['name'] not in [d['name'] for d in to_delete]:
+                            # minimal export shape
+                            remaining.append({
+                                'name': r.get('name'),
+                                'scope': r.get('scope'),
+                                'container': r.get('container'),
+                                'storage': r.get('storage'),
+                                'lastRun': r.get('lastRun'),
+                            })
+                    try:
+                        update_split_after_deletions(remaining)
+                        print(" Updated split settings to reflect export deletions.")
+                    except Exception as ex:
+                        print(f" WARN: Failed to update split settings after deletions: {ex}")
     else:
         if all_export_rows:
             print(" No export deletions selected.")

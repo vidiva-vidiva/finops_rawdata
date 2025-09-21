@@ -38,9 +38,14 @@ from azure.storage.blob import BlobServiceClient
 
 # ---------- Constants ----------
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
+USER_SETTINGS_FILE = os.getenv("USER_SETTINGS_FILE", "user_settings.json")
+FINLYT_SETTINGS_FILE = os.getenv("FINLYT_SETTINGS_FILE", "finlyt_settings.json")
+CM_EXPORT_SETTINGS_FILE = os.getenv("CM_EXPORT_SETTINGS_FILE", "cm_export_settings.json")
 UTC = timezone.utc
 EXPORTS_API = "2025-03-01"   # Exports API version
 RETRYABLE = {429, 500, 502, 503, 504}
+
+from settings_io import update_exports  # shared settings writer (no legacy writes)
 
 # ---------- Infra (SDK) ----------
 def ensure_rg(cred, subscription_id: str, rg_name: str, location: str, tags: dict | None = None):
@@ -489,13 +494,17 @@ def _strip_quotes(s: str) -> str:
         return s[1:-1].strip()
     return s
 
+EXIT_TOKENS = {"q","quit","exit","x"}
+
 def _prompt(msg: str, default: str | None = None) -> str:
     try:
         raw = input(f"{msg}{' ['+default+']' if default else ''}: ").strip()
-        val = raw or (default or '')
-        return _strip_quotes(val)
     except EOFError:
         return _strip_quotes(default or '')
+    if raw.lower() in EXIT_TOKENS:
+        return "__EXIT__"
+    val = raw or (default or '')
+    return _strip_quotes(val)
 
 def _choose(msg: str, options: list[str], default_index: int | None = None) -> str:
     print(msg)
@@ -503,6 +512,9 @@ def _choose(msg: str, options: list[str], default_index: int | None = None) -> s
         print(f" {i}. {o}")
     while True:
         raw = _prompt("Enter choice", str(default_index+1) if default_index is not None else None)
+        if raw == "__EXIT__":
+            print("Exit requested.")
+            sys.exit(0)
         try:
             idx = int(raw)
             if 1 <= idx <= len(options):
@@ -524,6 +536,9 @@ def _multiselect(msg: str, options: list[str], default_indices: list[int] | None
     default_str = ",".join(str(i+1) for i in default_indices) if default_indices else None
     while True:
         raw = _prompt("Select one or more (comma-separated)", default_str)
+        if raw == "__EXIT__":
+            print("Exit requested.")
+            sys.exit(0)
         parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
         try:
             idxs = sorted({int(p)-1 for p in parts}) if parts else (default_indices or [])
@@ -604,6 +619,31 @@ def interactive_flow(cred, settings):
     Minimal interactive: user selects SCOPE and DATASETS only.
     Destination (RG/SA/container/export names) comes entirely from Bicep/settings.
     """
+    # --- UI helpers ---
+    class UI:
+        ENABLE = sys.stdout.isatty()
+        @staticmethod
+        def c(code: str) -> str:
+            if not UI.ENABLE:
+                return ''
+            return f"\033[{code}m"
+        BOLD = lambda: UI.c('1')
+        DIM = lambda: UI.c('2')
+        GREEN = lambda: UI.c('32')
+        CYAN = lambda: UI.c('36')
+        YELLOW = lambda: UI.c('33')
+        RED = lambda: UI.c('31')
+        RESET = lambda: UI.c('0')
+        @staticmethod
+        def banner(text: str):
+            line = '=' * len(text)
+            print(f"{UI.CYAN()}{line}\n{text}\n{line}{UI.RESET()}")
+        @staticmethod
+        def step(n: int, msg: str):
+            print(f"{UI.BOLD()}{UI.CYAN()}[Step {n}]{UI.RESET()} {msg}")
+
+    UI.banner('Finlyt Export Interactive Wizard (type q to exit)')
+    print(f"{UI.DIM()}Press Ctrl+C or type 'q' anytime to abort. Values in [] show defaults. Enter to accept.{UI.RESET()}")
     # 1) Determine scope (prefer recommendation)
     seeded = suggest_defaults_from_settings(settings)
     rec_scope_id = (seeded or {}).get("scope_id")
@@ -614,10 +654,14 @@ def interactive_flow(cred, settings):
         r = http_with_backoff(requests.get, url, headers=headers, timeout=30)
         return r is not None and r.status_code in (200,204,401,403)
 
+    UI.step(1, 'Select export scope')
     if rec_scope_id and _scope_exists(cred, rec_scope_id):
-        print("\nDetected recommended export scope from settings:")
-        print(f"  {rec_scope_id}")
-        if _prompt("Use recommended scope? (Y/n)", "Y").lower().startswith('y'):
+        print(f"Detected recommended export scope: {UI.BOLD()}{rec_scope_id}{UI.RESET()}")
+        ans_use = _prompt("Use recommended scope? (Y/n)", "Y")
+        if ans_use == "__EXIT__":
+            print("Exit requested.")
+            return
+        if ans_use.lower().startswith('y'):
             scope_id = rec_scope_id
         else:
             scope_id = None
@@ -906,6 +950,7 @@ def interactive_flow(cred, settings):
                 }
 
     # 2) Destination ensure/deploy
+    UI.step(2, 'Resolve / deploy destination storage')
     if override_meta is not None:
         meta = override_meta
     else:
@@ -976,7 +1021,8 @@ def interactive_flow(cred, settings):
     parsed_scope = _parse_scope_id(scope_id)
     scope_type = parsed_scope.get('type')
     reservation_supported = scope_type in ("billingAccount","billingProfile","invoiceSection")
-    print("\nDataset availability:")
+    UI.step(3, 'Choose datasets & options')
+    print("Dataset availability:")
     print("  FOCUS, ActualCost, AmortizedCost, Usage: supported for all selected scopes")
     if reservation_supported:
         print("  Reservation: supported for billingAccount / billingProfile / invoiceSection scopes")
@@ -992,7 +1038,11 @@ def interactive_flow(cred, settings):
         print("  -> Skipping Reservation dataset (unsupported at this scope type).")
 
     # Ask for simple path mode (flatten: rootFolderPath="")
-    simple_path_mode = _prompt("Simplify paths (store directly under container/<exportName>/...)? (y/N)", "N").lower().startswith('y')
+    spm_ans = _prompt("Simplify paths (store directly under container/<exportName>/...)? (y/N)", "N")
+    if spm_ans == "__EXIT__":
+        print("Exit requested.")
+        return
+    simple_path_mode = spm_ans.lower().startswith('y')
 
     ds_recurrences = {
         "FOCUS": ["Daily","Monthly"],
@@ -1005,7 +1055,11 @@ def interactive_flow(cred, settings):
     fmt_choice = _choose("Format (affects all datasets, some may override):", ["Parquet","Csv"], 0)
     comp_default = 'Snappy' if fmt_choice=='Parquet' else 'Gzip'
     compression = _choose("Compression:", ["None","Gzip","Snappy"], ["None","Gzip","Snappy"].index(comp_default))
-    overwrite = _prompt("Overwrite existing files for same period? (y/N)", "N").lower().startswith('y')
+    ow_ans = _prompt("Overwrite existing files for same period? (y/N)", "N")
+    if ow_ans == "__EXIT__":
+        print("Exit requested.")
+        return
+    overwrite = ow_ans.lower().startswith('y')
 
     ds_to_container_key = {
         'FOCUS':'daily','ActualCost':'daily','AmortizedCost':'daily','Usage':'daily','Reservation':'reservation'}
@@ -1027,13 +1081,17 @@ def interactive_flow(cred, settings):
         'Reservation': 'ReservationDetails',
     }
 
-    print("\nExport deployment plan:")
+    UI.step(4, 'Review planned exports')
+    print("Export deployment plan:")
     print(f" Scope: {scope_id}")
     print(f" Destination (planned): {export_dest_resource_id}")
     for ds in datasets:
         recs = ds_recurrences.get(ds, ['Daily'])
         print(f"  - {ds}: {', '.join([r + ' (' + tf_map[r] + ')' for r in recs])}")
     proceed = _prompt('Proceed with deployment and export creation? (Y/n)', 'Y')
+    if proceed == "__EXIT__":
+        print("Exit requested.")
+        return
     if not proceed.lower().startswith('y'):
         print("Aborted. No new resources deployed. No exports created.")
         return
@@ -1042,6 +1100,9 @@ def interactive_flow(cred, settings):
     if override_meta and override_meta.get('pending') == 'bicep':
         plan = override_meta
         try:
+            clean_tags = {k: v for k, v in (plan.get('tags') or {}).items() if k.lower() != 'mode'}
+            if 'Application' not in clean_tags:
+                clean_tags['Application'] = 'FinlytHub'
             deployed = deploy_finlythub_via_bicep(
                 cred=cred,
                 subscription_id=plan['subscription_id'],
@@ -1050,7 +1111,7 @@ def interactive_flow(cred, settings):
                 hub_name=plan['hub_name'],
                 mi_name=plan['mi_name'],
                 location=plan['location'],
-                tags=plan.get('tags', {"Application":"FinlytHub","Mode":"Override"})
+                tags=clean_tags
             )
             override_meta.update(deployed)
         except Exception as ex:
@@ -1059,7 +1120,10 @@ def interactive_flow(cred, settings):
     elif override_meta and override_meta.get('pending') == 'sdk':
         plan = override_meta
         try:
-            ensure_rg(cred, plan['subscription_id'], plan['resource_group'], plan['location'], tags=plan.get('tags') or {"Application":"FinlytHub","Mode":"Override"})
+            base_tags = {k:v for k,v in (plan.get('tags') or {}).items() if k.lower() != 'mode'}
+            if 'Application' not in base_tags:
+                base_tags['Application'] = 'FinlytHub'
+            ensure_rg(cred, plan['subscription_id'], plan['resource_group'], plan['location'], tags=base_tags or {"Application":"FinlytHub"})
             ensure_sa(cred, plan['subscription_id'], plan['resource_group'], plan['storage_account_name'], plan['location'])
             for c in ['daily','monthly','reservation']:
                 try:
@@ -1075,6 +1139,9 @@ def interactive_flow(cred, settings):
     export_dest_resource_id = meta["resource_id"]
     containers = meta.get('containers', {})
 
+    created_summary = []
+    total_exports_planned = sum(len(ds_recurrences.get(ds, ['Daily'])) for ds in datasets)
+    processed = 0
     for ds in datasets:
         for recurrence in ds_recurrences.get(ds, ['Daily']):
             # Choose container per dataset+recurrence
@@ -1122,9 +1189,12 @@ def interactive_flow(cred, settings):
             )
             try:
                 create_or_update_export(cred, scope_id, name, body)
-                print(f" Created/updated {name} ({ds} | {recurrence} | {timeframe}) -> status: OK -> container: {container_name}")
+                processed += 1
+                created_summary.append({"export": name, "dataset": ds, "recurrence": recurrence, "container": container_name, "timeframe": timeframe})
+                print(f" {UI.GREEN()}✔{UI.RESET()} {name} ({ds} | {recurrence} | {timeframe}) -> container: {container_name}  [{processed}/{total_exports_planned}]")
             except RuntimeError as ex:
-                print(f"  WARN: Failed to create {name} ({ds} | {recurrence}): {ex}")
+                processed += 1
+                print(f" {UI.YELLOW()}!{UI.RESET()} Failed to create {name} ({ds} | {recurrence}): {ex}  [{processed}/{total_exports_planned}]")
                 continue
 
     # Offer optional historical seeding
@@ -1245,7 +1315,7 @@ def interactive_flow(cred, settings):
                             try:
                                 create_or_update_export(cred, scope_id, sched_name, body)
                                 run_export(cred, scope_id, sched_name)
-                                print(f"    {ds} {cur.strftime('%Y%m')} submitted")
+                                print(f"    {UI.GREEN()}•{UI.RESET()} {ds} {cur.strftime('%Y%m')} submitted")
                                 manifest_entries.append({"dataset":ds,"month":cur.strftime('%Y%m'),"action":"submitted","export":sched_name,"overwrite":overwrite_months})
                             except Exception as ex:
                                 print(f"    WARN {ds} {cur.strftime('%Y%m')}: {ex}")
@@ -1269,20 +1339,9 @@ def interactive_flow(cred, settings):
                             print(f"    WARN: Failed to restore schedule for {sched_name}: {ex}")
                         # Write manifest per dataset
                         try:
-                            manifest = {
-                                "type":"historical-seeding",
-                                "mode":"simple-path-reuse",
-                                "scope": scope_id,
-                                "dataset": ds,
-                                "export": sched_name,
-                                "started": manifest_start,
-                                "ended": datetime.now(UTC).isoformat(),
-                                "entries": manifest_entries
-                            }
-                            mf_name = f"historical_seed_manifest_{ds.lower()}_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json"
-                            with open(mf_name,'w') as mf:
-                                json.dump(manifest,mf,indent=2)
-                            print(f"    Manifest written -> {mf_name}")
+                            # Manifest file writing removed per new requirement (no historical_seed_manifest_*.json files)
+                            # Could log summary inline instead of file persistence.
+                            print(f"    Historical seeding summary: {len(manifest_entries)} month actions for {ds} (manifest persistence disabled)")
                         except Exception as mex:
                             print(f"    WARN: Failed to write manifest: {mex}")
                 else:
@@ -1303,7 +1362,31 @@ def interactive_flow(cred, settings):
             except Exception as ex:
                 print(f" Historical seeding failed: {ex}")
 
-    print("\nDone.")
+    UI.step(5, 'Summary')
+    if created_summary:
+        print(f"{UI.BOLD()}Created/Updated Exports:{UI.RESET()}")
+        for e in created_summary:
+            print(f"  - {e['export']} ({e['dataset']} {e['recurrence']}) -> {e['container']} :: {e['timeframe']}")
+        # Convert created_summary to export-like structures for settings update
+        export_records = []
+        for e in created_summary:
+            export_records.append({
+                "name": e.get('export'),
+                "dataset": e.get('dataset'),
+                "recurrence": e.get('recurrence'),
+                "container": e.get('container'),
+                "timeframe": e.get('timeframe'),
+                "updated": datetime.utcnow().isoformat() + 'Z'
+            })
+        try:
+            # Overwrite exports_running list with newly created/updated exports
+            update_exports(export_records)
+            print("Updated split settings with new/updated exports.")
+        except Exception as ex:
+            print(f"WARN: Failed to update split settings: {ex}")
+    else:
+        print("No exports were created or updated.")
+    print(f"{UI.GREEN()}All done.{UI.RESET()}")
 
 
 # ---------- CLI ----------
