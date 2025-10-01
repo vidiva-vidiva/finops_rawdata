@@ -1202,10 +1202,14 @@ def interactive_flow(cred, settings):
             else:
                 container_key = 'monthly' if recurrence.lower() == 'monthly' else 'daily'
             container_name = containers.get(container_key, container_key)
+            # Ensure destination container (best-effort; continue on failure, warning shown later if export fails)
+            container_ok = True
             try:
                 ensure_container(cred, meta['storage_account_name'], container_name)
-            except Exception:
-                pass
+            except Exception as ex:
+                container_ok = False
+                if not QUIET:
+                    print(f"  (warn) could not ensure container '{container_name}': {ex}")
             export_type = dataset_api_type.get(ds, ds)
             fmt = fmt_choice
             if export_type in ("ReservationDetails","ReservationRecommendations","ReservationTransactions"):
@@ -1230,6 +1234,11 @@ def interactive_flow(cred, settings):
             root_path = default_roots.get(ds,'exports')
             if simple_path_mode:
                 root_path = name
+            # Skip reservation at scopes where API disallows it (observed 400 error).
+            if export_type == 'ReservationDetails' and parsed_scope.get('type') not in ('billingProfile','invoiceSection'):
+                processed += 1
+                print(f" {UI.YELLOW()}!{UI.RESET()} Skipped {name} ({ds} | {recurrence}): Reservation dataset not supported at scope type '{parsed_scope.get('type')}'.  [{processed}/{total_exports_planned}]")
+                continue
             body = build_export_body(
                 dataset=export_type, recurrence=recurrence,
                 dest_resource_id=export_dest_resource_id,
@@ -1264,7 +1273,11 @@ def interactive_flow(cred, settings):
                     for ds in elig:
                         export_type = dataset_api_type.get(ds, ds)
                         container_name = containers.get('monthly','monthly')
-                        ensure_container(cred, meta['storage_account_name'], container_name)
+                        try:
+                            ensure_container(cred, meta['storage_account_name'], container_name)
+                        except Exception as ex:
+                            if not QUIET:
+                                print(f"  (warn) could not ensure monthly container '{container_name}': {ex}")
                         # Determine export name used for scheduled monthly export for this dataset
                         if simple_path_mode:
                             short_map = {'ActualCost':'actual','AmortizedCost':'amort','Usage':'usage','FOCUS':'focus'}
