@@ -22,6 +22,7 @@ Docs: https://learn.microsoft.com/rest/api/cost-management/exports/create-or-upd
 import os, sys, json, time, re, hashlib, subprocess
 # API versions (centralized)
 EXPORTS_API = "2025-03-01"  # Cost Management Exports API version aligned with detection script
+STORAGE_API = "2022-09-01"   # Storage Management API version for name availability
 QUIET = os.getenv('FINLYT_QUIET','0') == '1'
 def _qprint(msg: str):
     if not QUIET:
@@ -37,6 +38,58 @@ from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
 from azure.storage.blob import BlobServiceClient
+
+# ---------- Infra ensure helpers ----------
+def ensure_rg(cred, subscription_id: str, rg_name: str, location: str, tags: dict | None = None):
+    """Create resource group if missing (idempotent)."""
+    try:
+        client = ResourceManagementClient(cred, subscription_id)
+        try:
+            existing = client.resource_groups.get(rg_name)
+            if existing and existing.location:
+                return
+        except Exception:
+            pass
+        params = {"location": location, "tags": tags or {}}
+        client.resource_groups.create_or_update(rg_name, params)
+    except Exception as ex:
+        raise RuntimeError(f"Failed to ensure resource group {rg_name}: {ex}")
+
+def ensure_sa(cred, subscription_id: str, rg_name: str, sa_name: str, location: str):
+    """Create storage account if missing (LRS, standard)."""
+    try:
+        smc = StorageManagementClient(cred, subscription_id)
+        try:
+            acct = smc.storage_accounts.get_properties(rg_name, sa_name)
+            if acct:
+                return
+        except Exception:
+            pass
+        params = {
+            "location": location,
+            "sku": {"name": "Standard_LRS"},
+            "kind": "StorageV2",
+            "enable_https_traffic_only": True,
+            "tags": {"Application": "FinlytHub"}
+        }
+        poller = smc.storage_accounts.begin_create(rg_name, sa_name, params)
+        poller.result()
+    except Exception as ex:
+        raise RuntimeError(f"Failed to ensure storage account {sa_name}: {ex}")
+
+def ensure_container(cred, sa_name: str, container: str):
+    """Create blob container if missing."""
+    try:
+        bsc = BlobServiceClient(f"https://{sa_name}.blob.core.windows.net", credential=cred)
+        cc = bsc.get_container_client(container)
+        try:
+            cc.get_container_properties()
+            return
+        except Exception:
+            pass
+        cc.create_container()
+    except Exception as ex:
+        raise RuntimeError(f"Failed to ensure container {container} in {sa_name}: {ex}")
 
 def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_path: str,
                                hub_name: str, mi_name: str, location: str, tags: Dict[str, str]) -> Dict[str, Any]:
@@ -410,6 +463,39 @@ def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
                 _qprint(f"  WARN {ds} {yyyymm}: {ex}")
             time.sleep(1.0)  # light pacing to reduce throttling risk
     _qprint("[historical] Historical export runs queued. Files appear as runs complete.")
+
+
+# ---------- Storage helpers ----------
+def is_storage_account_name_available(cred, subscription_id: str, name: str) -> tuple[bool, str | None]:
+    """Check if a storage account name is globally available.
+
+    Returns (available, reason). On network or transient failures returns (True, None) to avoid blocking.
+    """
+    name = (name or '').strip()
+    if not name:
+        return False, "empty name"
+    try:
+        token = get_token(cred)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = (f"https://management.azure.com/subscriptions/{subscription_id}/providers/"
+               f"Microsoft.Storage/checkNameAvailability?api-version={STORAGE_API}")
+        body = {"name": name, "type": "Microsoft.Storage/storageAccounts"}
+        r = http_with_backoff(requests.post, url, headers=headers, json_body=body, timeout=30)
+        if r is None:
+            return True, None
+        try:
+            data = r.json() or {}
+        except Exception:
+            data = {}
+        if 'nameAvailable' in data:
+            avail = bool(data.get('nameAvailable'))
+            msg = data.get('message') or data.get('reason')
+            return avail, msg
+        if getattr(r, 'status_code', 0) == 409:
+            return False, "conflict"
+        return True, None
+    except Exception as ex:
+        return True, f"check skipped ({ex})"
 
 
 # ---------- Settings helpers ----------
