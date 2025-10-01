@@ -18,83 +18,17 @@ Scopes supported by Exports API (2025-03-01):
 Docs: https://learn.microsoft.com/rest/api/cost-management/exports/create-or-update?view=rest-cost-management-2025-03-01
 """
 
-import os
-import sys
-import json
-import uuid
-import argparse
-import hashlib
+# ---------- Imports ----------
+import os, sys, json, time, re, hashlib, subprocess
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional
-from finlyt_common import run_cmd, compile_bicep_to_json, http_with_backoff, get_token
-
 import requests
-import subprocess
-import time
+
+from finlyt_common import run_cmd, compile_bicep_to_json, http_with_backoff, get_token
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
 from azure.storage.blob import BlobServiceClient
-
-# ---------- Constants ----------
-SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
-USER_SETTINGS_FILE = os.getenv("USER_SETTINGS_FILE", "user_settings.json")
-FINLYT_SETTINGS_FILE = os.getenv("FINLYT_SETTINGS_FILE", "finlyt_settings.json")
-CM_EXPORT_SETTINGS_FILE = os.getenv("CM_EXPORT_SETTINGS_FILE", "cm_export_settings.json")
-UTC = timezone.utc
-EXPORTS_API = "2025-03-01"   # Exports API version
-RETRYABLE = {429, 500, 502, 503, 504}
-
-from settings_io import update_exports  # shared settings writer (no legacy writes)
-
-# ---------- Infra (SDK) ----------
-def ensure_rg(cred, subscription_id: str, rg_name: str, location: str, tags: dict | None = None):
-    """Ensure resource group exists and is tagged.
-    Merges existing tags with supplied tags (supplied wins on key conflict)."""
-    rm = ResourceManagementClient(cred, subscription_id)
-    existing_tags = {}
-    try:
-        rg = rm.resource_groups.get(rg_name)
-        existing_tags = getattr(rg, 'tags', {}) or {}
-    except Exception:
-        existing_tags = {}
-    merged = existing_tags.copy()
-    if tags:
-        merged.update(tags)
-    body = {"location": location}
-    if merged:
-        body["tags"] = merged
-    rm.resource_groups.create_or_update(rg_name, body)
-
-def ensure_sa(cred, subscription_id: str, rg_name: str, sa_name: str, location: str, sku: str = "Standard_LRS"):
-    sm = StorageManagementClient(cred, subscription_id)
-    try:
-        sm.storage_accounts.get_properties(rg_name, sa_name)
-        return
-    except Exception:
-        pass
-    poller = sm.storage_accounts.begin_create(
-        rg_name, sa_name,
-        {"sku": {"name": sku}, "kind": "StorageV2", "location": location, "enable_https_traffic_only": True}
-    )
-    poller.result()
-
-def is_storage_account_name_available(cred, subscription_id: str, name: str) -> tuple[bool, str | None]:
-    """Check global availability of a storage account name. Returns (available, reason)."""
-    try:
-        sm = StorageManagementClient(cred, subscription_id)
-        resp = sm.storage_accounts.check_name_availability({"name": name, "type": "Microsoft.Storage/storageAccounts"})
-        return (bool(getattr(resp, 'name_available', False)), getattr(resp, 'message', None))
-    except Exception as ex:
-        return (True, f"check_name_availability_failed: {ex}")
-
-def ensure_container(cred, sa_name: str, container: str):
-    blob = BlobServiceClient(f"https://{sa_name}.blob.core.windows.net", credential=cred)
-    cc = blob.get_container_client(container)
-    try:
-        cc.get_container_properties()
-    except Exception:
-        cc.create_container()
 
 def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_path: str,
                                hub_name: str, mi_name: str, location: str, tags: Dict[str, str]) -> Dict[str, Any]:
@@ -869,7 +803,7 @@ def interactive_flow(cred, settings):
                     "uami": {},
                     "containers": {"daily":"daily","monthly":"monthly","reservation":"reservation"},
                     # Ensure tags captured for later ensure_rg() call at commit stage
-                    "tags": {"Application":"FinlytHub","Mode":"Override"}
+                    "tags": {"Application":"FinlytHub"}
                 }
             else:
                 # Bicep override path: collect (optionally different) sub / RG / location / hub name
@@ -946,75 +880,10 @@ def interactive_flow(cred, settings):
                     "resource_id": f"/subscriptions/{o_sub}/resourceGroups/{o_rg}/providers/Microsoft.Storage/storageAccounts/{o_hub}",
                     "uami": {},
                     "containers": {"daily":"daily","monthly":"monthly","reservation":"reservation"},
-                    "tags": {"Application":"FinlytHub","Mode":"Override"}
+                    "tags": {"Application":"FinlytHub"}
                 }
 
-    # 2) Destination ensure/deploy
-    UI.step(2, 'Resolve / deploy destination storage')
-    if override_meta is not None:
-        meta = override_meta
-    else:
-        finlyt = settings.get('finlyt', {}) if isinstance(settings, dict) else {}
-        dest_sub = (finlyt.get('subscription', {}) or {}).get('id')
-        dest_rg  = (finlyt.get('resource_group', {}) or {}).get('name')
-        dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
-        if not dest_sub:
-            import re
-            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
-            if m_sub:
-                dest_sub = m_sub.group(1)
-            else:
-                dest_sub = None
-            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
-            if m_rg:
-                dest_rg = m_rg.group(1)
-        if not dest_rg and dest_sub:
-            dest_rg = f"rg-finlythub-{dest_sub[:8]}"
-        if not dest_sub or not dest_rg:
-            raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
-        suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
-        hub_name = f"finlythub{suffix}"
-        mi_name  = f"{hub_name}-mi"
-        existing_sa_id = (finlyt.get('Storage_account') or {}).get('id') if isinstance(finlyt, dict) else None
-        meta = None
-        # Always ensure/tag RG early (idempotent) so that reuse of existing storage also has tags
-        try:
-            ensure_rg(cred, dest_sub, dest_rg, dest_loc, tags={"Application":"FinlytHub"})
-        except Exception as _rg_ex:
-            print(f"  WARN: Failed to tag/ensure resource group {dest_rg}: {_rg_ex}")
-        if existing_sa_id:
-            parsed = _parse_storage_account_id(existing_sa_id)
-            if parsed.get('subscription') == dest_sub and parsed.get('resourceGroup') == dest_rg:
-                meta = {
-                    'resource_id': existing_sa_id,
-                    'storage_account_name': parsed.get('name'),
-                    'uami': {},
-                    'containers': {}
-                }
-                # Ensure containers and (re)tag RG even when reusing existing SA
-                try:
-                    ensure_rg(cred, dest_sub, dest_rg, dest_loc, tags={"Application":"FinlytHub"})
-                except Exception:
-                    pass
-                for c in ['daily','monthly','reservation']:
-                    try:
-                        ensure_container(cred, parsed.get('name'), c)
-                    except Exception:
-                        pass
-        if meta is None:
-            meta = deploy_finlythub_via_bicep(
-                cred=cred,
-                subscription_id=dest_sub,
-                rg_name=dest_rg,
-                bicep_path="./02_finlythub_deploy.bicep",
-                hub_name=hub_name,
-                mi_name=mi_name,
-                location=dest_loc,
-                tags={"Application":"FinlytHub"}
-            )
-
-    export_dest_resource_id = (meta or override_meta or {}).get("resource_id")
-    containers = (meta or override_meta or {}).get('containers', {})
+    # (Early destination ensure/deploy block removed; destination planning now deferred to later step.)
 
     # 3) Dataset selection only (multi-select)
     # Determine scope type to decide Reservation dataset availability
@@ -1081,14 +950,86 @@ def interactive_flow(cred, settings):
         'Reservation': 'ReservationDetails',
     }
 
-    UI.step(4, 'Review planned exports')
-    print("Export deployment plan:")
+    # 3) Destination planning (no deployment yet unless override_meta already represents an existing resource)
+    UI.step(3, 'Plan destination storage (deferred deployment)')
+    if override_meta is not None:
+        meta = override_meta  # Already contains pending plan ('bicep' | 'sdk')
+    else:
+        finlyt = settings.get('finlyt', {}) if isinstance(settings, dict) else {}
+        dest_sub = (finlyt.get('subscription', {}) or {}).get('id')
+        dest_rg  = (finlyt.get('resource_group', {}) or {}).get('name')
+        dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
+        if not dest_sub:
+            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
+            if m_sub:
+                dest_sub = m_sub.group(1)
+            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
+            if m_rg:
+                dest_rg = m_rg.group(1)
+        if not dest_rg and dest_sub:
+            dest_rg = f"rg-finlythub-{dest_sub[:8]}"
+        if not dest_sub or not dest_rg:
+            raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
+        suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
+        hub_name = f"finlythub{suffix}"
+        mi_name  = f"{hub_name}-mi"
+        existing_sa_id = (finlyt.get('Storage_account') or {}).get('id') if isinstance(finlyt, dict) else None
+        if existing_sa_id:
+            parsed_sa = _parse_storage_account_id(existing_sa_id)
+            if parsed_sa.get('subscription') == dest_sub and parsed_sa.get('resourceGroup') == dest_rg:
+                meta = {
+                    'pending': 'reuse-existing',
+                    'subscription_id': dest_sub,
+                    'resource_group': dest_rg,
+                    'location': dest_loc,
+                    'storage_account_name': parsed_sa.get('name'),
+                    'resource_id': existing_sa_id,
+                    'uami': {},
+                    'containers': {'daily':'daily','monthly':'monthly','reservation':'reservation'},
+                    'tags': {'Application':'FinlytHub'}
+                }
+            else:
+                # Fall back to planned Bicep deployment if existing SA not aligned
+                meta = {
+                    'pending': 'bicep-recommended',
+                    'subscription_id': dest_sub,
+                    'resource_group': dest_rg,
+                    'location': dest_loc,
+                    'hub_name': hub_name,
+                    'mi_name': mi_name,
+                    'resource_id': f"/subscriptions/{dest_sub}/resourceGroups/{dest_rg}/providers/Microsoft.Storage/storageAccounts/{hub_name}",
+                    'uami': {},
+                    'containers': {'daily':'daily','monthly':'monthly','reservation':'reservation'},
+                    'tags': {'Application':'FinlytHub'}
+                }
+        else:
+            meta = {
+                'pending': 'bicep-recommended',
+                'subscription_id': dest_sub,
+                'resource_group': dest_rg,
+                'location': dest_loc,
+                'hub_name': hub_name,
+                'mi_name': mi_name,
+                'resource_id': f"/subscriptions/{dest_sub}/resourceGroups/{dest_rg}/providers/Microsoft.Storage/storageAccounts/{hub_name}",
+                'uami': {},
+                'containers': {'daily':'daily','monthly':'monthly','reservation':'reservation'},
+                'tags': {'Application':'FinlytHub'}
+            }
+
+    export_dest_resource_id = (meta or {}).get('resource_id')
+    containers = (meta or {}).get('containers', {})
+
+    UI.step(4, 'Review planned exports & infrastructure')
+    print("Export & infrastructure plan (nothing deployed yet):")
     print(f" Scope: {scope_id}")
-    print(f" Destination (planned): {export_dest_resource_id}")
+    print(f" Destination storage account (planned): {export_dest_resource_id}")
+    pending_mode = (meta or {}).get('pending')
+    if pending_mode:
+        print(f" Deployment mode: {pending_mode}")
     for ds in datasets:
         recs = ds_recurrences.get(ds, ['Daily'])
         print(f"  - {ds}: {', '.join([r + ' (' + tf_map[r] + ')' for r in recs])}")
-    proceed = _prompt('Proceed with deployment and export creation? (Y/n)', 'Y')
+    proceed = _prompt('Commit deployment & create exports now? (Y/n)', 'Y')
     if proceed == "__EXIT__":
         print("Exit requested.")
         return
@@ -1096,40 +1037,50 @@ def interactive_flow(cred, settings):
         print("Aborted. No new resources deployed. No exports created.")
         return
 
-    # Commit deferred deployment if any
-    if override_meta and override_meta.get('pending') == 'bicep':
-        plan = override_meta
-        try:
+    # Commit deployment now based on pending mode
+    pending = meta.get('pending') if meta else None
+    try:
+        if pending in ('bicep','bicep-recommended'):
+            # Ensure RG then deploy via Bicep
+            ensure_rg(cred, meta['subscription_id'], meta['resource_group'], meta['location'], tags={'Application':'FinlytHub'})
             deployed = deploy_finlythub_via_bicep(
                 cred=cred,
-                subscription_id=plan['subscription_id'],
-                rg_name=plan['resource_group'],
+                subscription_id=meta['subscription_id'],
+                rg_name=meta['resource_group'],
                 bicep_path="./02_finlythub_deploy.bicep",
-                hub_name=plan['hub_name'],
-                mi_name=plan['mi_name'],
-                location=plan['location'],
-                tags=plan.get('tags', {"Application":"FinlytHub","Mode":"Override"})
+                hub_name=meta.get('hub_name') or f"finlythub{hashlib.sha1(meta['subscription_id'].encode()).hexdigest()[:8]}",
+                mi_name=meta.get('mi_name') or f"finlythub{hashlib.sha1(meta['subscription_id'].encode()).hexdigest()[:8]}-mi",
+                location=meta['location'],
+                tags={'Application':'FinlytHub'}
             )
-            override_meta.update(deployed)
-        except Exception as ex:
-            print(f" Deployment failed: {ex}")
-            return
-    elif override_meta and override_meta.get('pending') == 'sdk':
-        plan = override_meta
-        try:
-            ensure_rg(cred, plan['subscription_id'], plan['resource_group'], plan['location'], tags=plan.get('tags') or {"Application":"FinlytHub","Mode":"Override"})
-            ensure_sa(cred, plan['subscription_id'], plan['resource_group'], plan['storage_account_name'], plan['location'])
+            deployed['pending'] = None
+            meta.update(deployed)
+        elif pending == 'sdk':
+            ensure_rg(cred, meta['subscription_id'], meta['resource_group'], meta['location'], tags={'Application':'FinlytHub'})
+            ensure_sa(cred, meta['subscription_id'], meta['resource_group'], meta['storage_account_name'], meta['location'])
             for c in ['daily','monthly','reservation']:
                 try:
-                    ensure_container(cred, plan['storage_account_name'], c)
+                    ensure_container(cred, meta['storage_account_name'], c)
                 except Exception:
                     pass
-        except Exception as ex:
-            print(f" Ensure failed: {ex}")
-            return
-    # Resolve meta after potential deployment
-    if override_meta:
-        meta = override_meta
+            meta['pending'] = None
+        elif pending == 'reuse-existing':
+            # Just ensure RG tags & containers
+            try:
+                ensure_rg(cred, meta['subscription_id'], meta['resource_group'], meta['location'], tags={'Application':'FinlytHub'})
+            except Exception:
+                pass
+            for c in ['daily','monthly','reservation']:
+                try:
+                    ensure_container(cred, meta['storage_account_name'], c)
+                except Exception:
+                    pass
+            meta['pending'] = None
+        # else: already deployed / no infra needed
+    except Exception as ex:
+        print(f" Deployment failed: {ex}")
+        return
+
     export_dest_resource_id = meta["resource_id"]
     containers = meta.get('containers', {})
 
@@ -1356,7 +1307,7 @@ def interactive_flow(cred, settings):
             except Exception as ex:
                 print(f" Historical seeding failed: {ex}")
 
-    UI.step(5, 'Summary')
+    UI.step(6, 'Summary')
     if created_summary:
         print(f"{UI.BOLD()}Created/Updated Exports:{UI.RESET()}")
         for e in created_summary:
