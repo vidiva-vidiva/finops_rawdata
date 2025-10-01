@@ -29,6 +29,7 @@ from typing import Dict, Any, Optional
 import requests
 
 from finlyt_common import run_cmd, compile_bicep_to_json, http_with_backoff, get_token
+from settings_io import load_aggregated as load_split_settings, update_exports
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
@@ -1313,9 +1314,10 @@ def interactive_flow(cred, settings):
 
     UI.step(6, 'Summary')
     if created_summary:
-        print(f"{UI.BOLD()}Created/Updated Exports:{UI.RESET()}")
-        for e in created_summary:
-            print(f"  - {e['export']} ({e['dataset']} {e['recurrence']}) -> {e['container']} :: {e['timeframe']}")
+        if not QUIET:
+            print(f"{UI.BOLD()}Created/Updated Exports:{UI.RESET()}")
+            for e in created_summary:
+                print(f"  - {e['export']} ({e['dataset']} {e['recurrence']}) -> {e['container']} :: {e['timeframe']}")
         # Convert created_summary to export-like structures for settings update
         export_records = []
         for e in created_summary:
@@ -1330,19 +1332,22 @@ def interactive_flow(cred, settings):
         try:
             # Overwrite exports_running list with newly created/updated exports
             update_exports(export_records)
-            print("Updated split settings with new/updated exports.")
+            if not QUIET:
+                print("Updated split settings with new/updated exports.")
         except Exception as ex:
-            print(f"WARN: Failed to update split settings: {ex}")
+            if not QUIET:
+                print(f"WARN: Failed to update split settings: {ex}")
     else:
-        print("No exports were created or updated.")
-    print(f"{UI.GREEN()}All done.{UI.RESET()}")
+        if not QUIET:
+            print("No exports were created or updated.")
+    if not QUIET:
+        print(f"{UI.GREEN()}All done.{UI.RESET()}")
 
 
 def main():
-    # Purely interactive: load settings (best-effort) then invoke interactive_flow.
-    settings_path = SETTINGS_FILE
+    # Purely interactive: load aggregated split settings best-effort.
     try:
-        settings = load_settings(settings_path) if os.path.exists(settings_path) else {}
+        settings = load_split_settings()
     except Exception:
         settings = {}
     cred = DefaultAzureCredential()
