@@ -21,55 +21,99 @@ The legacy `settings.json` is no longer written. It may still be read as a fallb
 
 Optional: Azure CLI for best detection fidelity (signed-in user OID, bicep build fallback).
 
+## Get Started
+
+Use one of the quick-start paths below (local shell or Azure Cloud Shell). Azure CLI login improves detection fidelity.
+
+### Quick Start (recommended)
+```bash
+az login                                # authenticate (skip if already logged in)
+az account set --subscription <subId>   # optional: pick subscription context
+git clone https://github.com/vidiva-vidiva/finops_rawdata.git finlyt-hub
+cd finlyt-hub
+python 00_setup_finlythub.py            # auto: creates .venv, installs deps, runs detection, launches menu
+```
+
+### One‑liner (curl bootstrap)
+```bash
+curl -O https://raw.githubusercontent.com/vidiva-vidiva/finops_rawdata/main/bootstrap_finlyt.sh \
+  && bash bootstrap_finlyt.sh
+```
+
+### What happens on first run
+- A local `.venv/` is created (unless you pass `--no-venv` or set `FINLYT_DISABLE_VENV=1`).
+- `requirements.txt` dependencies are installed if missing.
+- Detection runs to generate: `user_settings.json`, `finlyt_settings.json`, `cm_export_settings.json`.
+- The interactive menu lets you Install (deploy hub + exports) or Manage / Cleanup.
+
+### Optional manual virtual environment (if you prefer explicit steps)
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python 00_setup_finlythub.py
+```
+
+### Common flags / env vars
+- `--no-venv` : skip auto virtual environment creation
+- `--cleanup` : jump directly into cleanup module
+- `FINLYT_DISABLE_VENV=1` : environment variable alternative to `--no-venv`
+- `FINLYT_TEST_MODE=1` : write minimal split settings without full Azure SDKs (for offline testing)
+
+### Shortcuts & notes
+- Quit any prompt with: `q`, `quit`, `exit`, or `x`.
+- No legacy `settings.json` is written; only the three split files are authoritative.
+- Re-run detection from the menu whenever environment changes (new permissions/resources).
+- Limited permissions? You still get a partial state captured in the split settings.
+
+Advanced direct invocation of other scripts (`01_detect_*`, `02_deploy_*`, `03_cleanup_*`) is supported but not the documented path; prefer the single entry point.
+
+### Bootstrap script (optional single entry path)
+
+You can automate cloning, environment setup, and launching the single entry point with the helper script:
+
+```bash
+curl -O https://raw.githubusercontent.com/vidiva-vidiva/finops_rawdata/main/bootstrap_finlyt.sh
+bash bootstrap_finlyt.sh
+```
+
+What it does (idempotent):
+- Clones (or updates) the repo into `finlyt-hub/`
+- Creates/uses `.venv` virtual environment
+- Installs Python dependencies
+- Runs detection if split settings are missing
+- Launches the interactive orchestrator
+
+Flags (still end at the orchestrator unless suppressed):
+```bash
+bash bootstrap_finlyt.sh --just-detect        # Only run detection then exit
+bash bootstrap_finlyt.sh --no-orchestrator    # Skip launching 00_setup after detection
+bash bootstrap_finlyt.sh --force-detect       # Re-run detection even if files exist
+```
+
+Environment overrides:
+```bash
+REPO_URL=... TARGET_DIR=... PYTHON_BIN=python3.12 bash bootstrap_finlyt.sh
+```
+
+
 ## Scripts
 
-1) Detect – environment summary and recommendations
-- File: `01_detect_finlythub.py`
-- Output: writes split settings files (atomically)
-- Run:
-	```bash
-	python 01_detect_finlythub.py
-	```
-- What it does:
-	- Enumerates subscriptions you can access, checks provider registrations, policies, and permissions.
-	- Discovers tagged Finlyt Hub resources (RGs, Storage Accounts, Managed Identities).
-	- Lists existing Cost Management exports where permitted.
-	- Writes split settings; also adds a `tagged` inventory to `finlyt_settings.json`.
+The orchestrator internally invokes these components (single supported entry point):
 
-2) Orchestrate – Install / Repair menu (interactive)
-- File: `00_setup_finlythub.py`
-- Run:
-	```bash
-	python 00_setup_finlythub.py
-	```
-- Menu actions:
-	- Install Finlyt (interactive): launches the deploy wizard (02) and creates exports.
-	- Repair / Manage: change recommended scope/destination, seed historical, run cleanup.
-	- Cleanup: invokes `03_cleanup_finlythub.py` to remove exports/resources.
+1) Detection phase
+   - Gathers subscriptions, permissions, tagged resources, existing exports
+   - Writes/refreshes the split settings files (atomic)
 
-3) Deploy – Interactive export creation (+ optional hub deploy)
-- File: `02_deploy_finlythub.py`
-- Run:
-	```bash
-	python 02_deploy_finlythub.py --interactive
-	```
-- Highlights:
-	- Choose export scope (subscription/RG/MG/billing) and datasets (FOCUS, ActualCost, AmortizedCost, Usage, Reservation).
-	- Optionally deploy or reuse a storage destination (Finlyt Hub) with Bicep or SDK ensure.
-	- Writes new/updated exports back to split settings only (no legacy file).
-	- No longer sets or preserves any `Mode: Override` tag; only `Application: FinlytHub` is used when tagging.
+2) Deployment & export creation
+   - Wizard to pick scope, datasets, cadence, format
+   - Ensures or deploys Finlyt Hub destination (Bicep optional)
+   - Updates split settings (no legacy writes)
 
-4) Cleanup – Interactive export/resource cleanup
-- File: `03_cleanup_finlythub.py`
-- Run:
-	```bash
-	python 03_cleanup_finlythub.py
-	```
-- Features:
-	- Lists exports across selected scopes with width-aware tables.
-	- Validates referenced storage accounts (optional).
-	- Deletes chosen exports and updates split settings accordingly.
-	- Optionally deletes tagged resources (Application=FinlytHub).
+3) Cleanup
+   - Lists exports with width-aware table
+   - Deletes selected exports and updates settings
+   - Optional deletion of tagged infra resources (Application=FinlytHub)
 
 ## Settings model (split files)
 

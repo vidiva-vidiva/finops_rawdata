@@ -43,6 +43,69 @@ import requests
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(os.path.dirname(__file__), "settings.json"))  # legacy read-only
 from settings_io import load_aggregated, update_recommended_scope, update_destination
 
+# ----------------------- Virtual Environment Bootstrap -----------------------
+def _in_venv() -> bool:
+    return getattr(sys, 'real_prefix', None) is not None or sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+
+def _venv_python_path(venv_dir: str) -> str:
+    if os.name == 'nt':
+        return os.path.join(venv_dir, 'Scripts', 'python.exe')
+    return os.path.join(venv_dir, 'bin', 'python')
+
+def maybe_bootstrap_venv(disable: bool = False):
+    """Ensure a local .venv exists and re-exec inside it if not already.
+
+    Behavior:
+      * Skips if disable=True, already inside a venv, FINLYT_DISABLE_VENV=1, or FINLYT_VENV_BOOTSTRAPPED set.
+      * Creates .venv using current interpreter.
+      * Installs requirements.txt if present.
+      * Re-execs the script using the venv's Python with FINLYT_VENV_BOOTSTRAPPED=1 to prevent loops.
+    """
+    if disable or os.getenv('FINLYT_DISABLE_VENV') == '1' or os.getenv('FINLYT_VENV_BOOTSTRAPPED') == '1':
+        return
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    req_path = os.path.join(base_dir, 'requirements.txt')
+    if _in_venv():
+        # Already in a virtual environment; ensure deps if missing.
+        if os.path.isfile(req_path):
+            try:
+                import importlib
+                needed = False
+                for test_mod in ("azure.identity","azure.mgmt.resource","azure.mgmt.storage","azure.storage.blob"):
+                    try:
+                        importlib.import_module(test_mod)
+                    except Exception:
+                        needed = True
+                        break
+                if needed:
+                    _log("Detected missing Azure SDK modules; installing requirements into current venv...")
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'])
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', req_path])
+            except Exception as ex:
+                _log(f"Dependency installation skipped (non-fatal): {ex}")
+        return
+    venv_dir = os.path.join(base_dir, '.venv')
+    py_in_venv = _venv_python_path(venv_dir)
+    try:
+        if not os.path.exists(venv_dir):
+            _log("Creating virtual environment (.venv) ...")
+            subprocess.check_call([sys.executable, '-m', 'venv', venv_dir])
+        # Install requirements if available (fresh outer environment)
+        if os.path.isfile(req_path):
+            _log("Installing dependencies into .venv (requirements.txt)...")
+            subprocess.check_call([py_in_venv, '-m', 'pip', 'install', '--upgrade', 'pip'])
+            subprocess.check_call([py_in_venv, '-m', 'pip', 'install', '-r', req_path])
+        else:
+            _log("requirements.txt not found; skipping dependency install.")
+        # Re-exec in venv
+        env = os.environ.copy()
+        env['FINLYT_VENV_BOOTSTRAPPED'] = '1'
+        _log("Re-launching inside .venv ...")
+        os.execvpe(py_in_venv, [py_in_venv] + sys.argv, env)
+    except Exception as ex:
+        _log(f"Virtual environment bootstrap skipped (non-fatal): {ex}")
+        # Continue without venv
+
 
 # ----------------------- Helpers -----------------------
 def _log(msg: str):
@@ -634,8 +697,12 @@ def main():
     ap = argparse.ArgumentParser(description="FinlytHub interactive setup / management.")
     ap.add_argument('--settings', default=SETTINGS_FILE, help='Path to settings.json (default: repo root).')
     ap.add_argument('--cleanup', action='store_true', help='Launch cleanup directly and exit.')
+    ap.add_argument('--no-venv', action='store_true', help='Disable automatic .venv creation / re-exec.')
     args = ap.parse_args()
     SETTINGS_FILE = args.settings
+
+    # Auto-bootstrap virtual environment early (may re-exec and never return here in first pass)
+    maybe_bootstrap_venv(disable=args.no_venv)
 
     if args.cleanup:
         _log('Launching interactive cleanup (03_cleanup_finlythub.py)...')
