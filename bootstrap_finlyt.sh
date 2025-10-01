@@ -12,7 +12,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 JUST_DETECT=0
 NO_ORCH=0
 FORCE_DETECT=0
-QUIET=0
+# Default to quiet unless user asks for verbose
+QUIET=1
+VERBOSE=0
 
 usage() {
   cat <<EOF
@@ -22,7 +24,8 @@ Options:
   --just-detect        Run detection only (01) then exit
   --no-orchestrator    Skip launching orchestrator after detection
   --force-detect       Re-run detection even if split settings already exist
-  --quiet              Suppress detailed output (only high-level Finlyt lines)
+  --quiet              Suppress detailed output (default behavior)
+  --verbose            Show detailed progress (inverse of --quiet)
   -h, --help           Show this help
 
 Environment overrides:
@@ -38,7 +41,8 @@ while [[ $# -gt 0 ]]; do
   --just-detect) JUST_DETECT=1; shift ;;
   --no-orchestrator) NO_ORCH=1; shift ;;
   --force-detect) FORCE_DETECT=1; shift ;;
-  --quiet) QUIET=1; shift ;;
+  --quiet) QUIET=1; VERBOSE=0; shift ;;
+  --verbose) QUIET=0; VERBOSE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[Finlyt] Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -61,7 +65,7 @@ if command -v git >/dev/null 2>&1; then
   else
     info "Cloning repo into $TARGET_DIR";
     if [[ $QUIET -eq 1 ]]; then
-      git clone --quiet "$REPO_URL" "$TARGET_DIR";
+      git clone --quiet "$REPO_URL" "$TARGET_DIR" >/dev/null 2>&1;
     else
       git clone "$REPO_URL" "$TARGET_DIR";
     fi
@@ -84,7 +88,11 @@ fi
 
 if [[ ! -d .venv ]]; then
   info "Creating virtual environment (.venv)";
-  "$PYTHON_BIN" -m venv .venv
+  if [[ $QUIET -eq 1 ]]; then
+    "$PYTHON_BIN" -m venv .venv >/dev/null 2>&1
+  else
+    "$PYTHON_BIN" -m venv .venv
+  fi
 fi
 # shellcheck source=/dev/null
 source .venv/bin/activate
@@ -112,10 +120,17 @@ done
 
 if [[ $FORCE_DETECT -eq 1 || $MISSING -eq 1 ]]; then
   info "Running detection (01_detect_finlythub.py)"
-  python 01_detect_finlythub.py || {
+  if [[ $QUIET -eq 1 ]]; then
+    python 01_detect_finlythub.py >/dev/null 2>&1 || {
+      echo "[Finlyt] Detection failed" >&2
+      exit 1
+    }
+  else
+    python 01_detect_finlythub.py || {
     echo "[Finlyt] Detection failed" >&2
     exit 1
-  }
+    }
+  fi
 else
   info "Split settings already present; skipping detection (use --force-detect to override)"
 fi
@@ -132,6 +147,9 @@ fi
 
 if [[ -f 00_setup_finlythub.py ]]; then
   info "Launching orchestrator (00_setup_finlythub.py)"
+  if [[ $QUIET -eq 1 ]]; then
+    echo "[Finlyt] Ready."  # minimal cue before interactive menu
+  fi
   python 00_setup_finlythub.py
 else
   echo "[Finlyt] Orchestrator script missing" >&2

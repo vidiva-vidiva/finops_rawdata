@@ -17,6 +17,16 @@ from azure.identity import DefaultAzureCredential
 
 from finlyt_common import get_token, http_with_backoff
 
+QUIET = os.getenv('FINLYT_QUIET','0') == '1'
+def _log(msg: str):
+    if QUIET:
+        # show only errors/warnings
+        low = msg.lower()
+        if low.startswith('error') or low.startswith('warn'):
+            print(f"[Finlyt] {msg}")
+        return
+    print(f"[Finlyt] {msg}")
+
 EXPORTS_API = "2025-03-01"
 RESOURCE_API = "2022-09-01"
 MI_API = "2023-01-31"
@@ -101,6 +111,8 @@ def _print_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str]], tit
          (excluding first two) down to a floor (min 8 chars) until it fits.
       3. Truncate cell values to final column widths.
     """
+    if QUIET:
+        return  # suppress tables entirely in quiet mode
     if not rows:
         print(f"\n{title}: (none found)")
         return

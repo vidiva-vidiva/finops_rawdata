@@ -129,7 +129,8 @@ def run_detection(python_exe: str = sys.executable, force: bool = False) -> bool
     if not need:
         _log("Detection skipped (settings already present; use --force-detect to re-run).")
         return True
-    _log("Running detection (01_detect_finlythub.py)...")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        _log("Running detection (01_detect_finlythub.py)...")
     proc = subprocess.run([python_exe, "01_detect_finlythub.py"], capture_output=True, text=True)
     if proc.returncode != 0:
         # Testing fallback when azure SDK not present and FINLYT_TEST_MODE=1
@@ -179,7 +180,8 @@ def run_detection(python_exe: str = sys.executable, force: bool = False) -> bool
         _log("Detection failed:")
         sys.stderr.write(proc.stdout + proc.stderr)
         return False
-    _log("Detection complete.")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        _log("Detection complete.")
     return True
 
 
@@ -699,7 +701,8 @@ def root_menu(args):
         _summarize_environment(analysis)
         if choice == 0:  # Always interactive deploy
             cmd = [sys.executable, '02_deploy_finlythub.py']
-            _log('Launching interactive deploy: ' + ' '.join(cmd))
+            if os.getenv('FINLYT_QUIET','0') != '1':
+                _log('Launching interactive deploy: ' + ' '.join(cmd))
             rc = subprocess.call(cmd)
             if rc != 0:
                 _log(f'Interactive deploy failed (exit {rc}).')
