@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 from typing import Any, Dict, Optional, List, Tuple
+import json, os
 from datetime import datetime, date, timedelta
 import re
 import requests
@@ -566,7 +567,17 @@ def interactive_seed_historical(settings_path: str, settings: Dict[str,Any]):
 
 
 def interactive_add_exports(python_exe: str, settings_path: str):
-    cmd = [python_exe, '02_deploy_finlythub.py', '--interactive', '--settings', settings_path]
+    # Always materialize a fresh combined settings snapshot for the deploy script.
+    try:
+        combined = load_aggregated()
+        combined_path = os.path.join(os.path.dirname(settings_path), '.finlyt_combined_settings.json')
+        with open(combined_path, 'w', encoding='utf-8') as fh:
+            json.dump(combined, fh, indent=2)
+        use_settings_path = combined_path
+    except Exception:
+        # Fallback to original path (may be legacy or missing). Deploy script will attempt its own aggregation.
+        use_settings_path = settings_path
+    cmd = [python_exe, '02_deploy_finlythub.py', '--interactive', '--settings', use_settings_path]
     _log('Launching export creation (interactive)...')
     # Preflight dependency check so we can give a friendly message BEFORE entering wizard
     missing = []
