@@ -78,18 +78,32 @@ def ensure_sa(cred, subscription_id: str, rg_name: str, sa_name: str, location: 
         raise RuntimeError(f"Failed to ensure storage account {sa_name}: {ex}")
 
 def ensure_container(cred, sa_name: str, container: str):
-    """Create blob container if missing."""
-    try:
-        bsc = BlobServiceClient(f"https://{sa_name}.blob.core.windows.net", credential=cred)
-        cc = bsc.get_container_client(container)
+    """Create blob container if missing with a single retry on auth failure.
+
+    Handles transient InvalidAuthenticationInfo by retrying once (token refresh handled by DefaultAzureCredential).
+    """
+    attempts = 0
+    last_ex: Exception | None = None
+    while attempts < 2:
         try:
-            cc.get_container_properties()
+            bsc = BlobServiceClient(f"https://{sa_name}.blob.core.windows.net", credential=cred)
+            cc = bsc.get_container_client(container)
+            try:
+                cc.get_container_properties()
+                return
+            except Exception:
+                pass
+            cc.create_container()
             return
-        except Exception:
-            pass
-        cc.create_container()
-    except Exception as ex:
-        raise RuntimeError(f"Failed to ensure container {container} in {sa_name}: {ex}")
+        except Exception as ex:
+            msg = str(ex)
+            last_ex = ex
+            if 'InvalidAuthenticationInfo' in msg or 'AuthenticationError' in msg:
+                attempts += 1
+                time.sleep(1.0)
+                continue
+            break
+    raise RuntimeError(f"Failed to ensure container {container} in {sa_name}: {last_ex}")
 
 def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_path: str,
                                hub_name: str, mi_name: str, location: str, tags: Dict[str, str]) -> Dict[str, Any]:
@@ -432,7 +446,7 @@ def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
     hist_overwrite = (action == 'o')
 
     manifest_entries: list[dict] = []
-    manifest_start = datetime.utcnow().isoformat()
+    manifest_start = datetime.now(UTC).isoformat()
     for ds in datasets:
         api_type = dataset_api_type.get(ds, ds)
         ds_fmt = 'Csv' if api_type.startswith('Reservation') else fmt_choice
@@ -1415,7 +1429,7 @@ def interactive_flow(cred, settings):
                 "recurrence": e.get('recurrence'),
                 "container": e.get('container'),
                 "timeframe": e.get('timeframe'),
-                "updated": datetime.utcnow().isoformat() + 'Z'
+                "updated": datetime.now(UTC).isoformat() + 'Z'
             })
         try:
             # Overwrite exports_running list with newly created/updated exports
