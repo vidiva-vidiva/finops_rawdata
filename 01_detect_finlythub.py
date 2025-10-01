@@ -816,18 +816,22 @@ def main():
 
     oid = signed_in_object_id()
 
-    print("Detecting FinlytHub resources...")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        print("Detecting FinlytHub resources...")
     detected = detect_finlythub_resources(cred)
 
-    print("Enumerating subscriptions for preflight...")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        print("Enumerating subscriptions for preflight...")
     all_subs = gather_subscriptions(cred)
     all_sub_ids = [s.subscription_id for s in all_subs]
 
-    print("Building management group -> subscriptions map...")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        print("Building management group -> subscriptions map...")
     mg_to_subs = build_mg_to_subs_map(cred)
     mg_assign_cache = cache_mg_assignments(cred, mg_to_subs, oid)
 
-    print(f"Running preflight checks across {len(all_subs)} subscription(s) (max workers={MAX_WORKERS})...")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        print(f"Running preflight checks across {len(all_subs)} subscription(s) (max workers={MAX_WORKERS})...")
     from concurrent.futures import ThreadPoolExecutor, as_completed
     subscriptions_results: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -836,9 +840,11 @@ def main():
             try:
                 subscriptions_results.append(fut.result())
             except Exception as e:
-                print(f"[warn] preflight failed for one subscription: {e}")
+                if os.getenv('FINLYT_QUIET','0') != '1':
+                    print(f"[warn] preflight failed for one subscription: {e}")
 
-    print("Enriching hub and exports metadata (if detected)...")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        print("Enriching hub and exports metadata (if detected)...")
     hub = enrich_hub_and_exports(cred, detected)
 
     # Build comprehensive tagged resource inventories (multi-hub / multi-sub) for finlyt_settings extension
@@ -1289,14 +1295,17 @@ def main():
         atomic_write_settings(USER_SETTINGS_FILE, user_settings)
         atomic_write_settings(FINLYT_SETTINGS_FILE, finlyt_settings)
         atomic_write_settings(CM_EXPORT_SETTINGS_FILE, cm_export_settings)
-        print(f"[Finlyt][detect] user_settings -> {USER_SETTINGS_FILE}")
-        print(f"[Finlyt][detect] finlyt_settings -> {FINLYT_SETTINGS_FILE}")
-        print(f"[Finlyt][detect] cm_export_settings -> {CM_EXPORT_SETTINGS_FILE}")
+        if os.getenv('FINLYT_QUIET','0') != '1':
+            print(f"[Finlyt][detect] user_settings -> {USER_SETTINGS_FILE}")
+            print(f"[Finlyt][detect] finlyt_settings -> {FINLYT_SETTINGS_FILE}")
+            print(f"[Finlyt][detect] cm_export_settings -> {CM_EXPORT_SETTINGS_FILE}")
     except Exception as e:
-        print(f"[Finlyt][warn] Failed to write split settings files: {e}")
+        if os.getenv('FINLYT_QUIET','0') != '1':
+            print(f"[Finlyt][warn] Failed to write split settings files: {e}")
 
     # Legacy consolidated write removed (split settings only moving forward)
-    print(f"Detected {len(detected)} FinlytHub resource(s). Preflight across {len(all_subs)} subscription(s).")
+    if os.getenv('FINLYT_QUIET','0') != '1':
+        print(f"Detected {len(detected)} FinlytHub resource(s). Preflight across {len(all_subs)} subscription(s).")
 
 
 if __name__ == "__main__":

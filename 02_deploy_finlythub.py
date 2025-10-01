@@ -20,6 +20,10 @@ Docs: https://learn.microsoft.com/rest/api/cost-management/exports/create-or-upd
 
 # ---------- Imports ----------
 import os, sys, json, time, re, hashlib, subprocess
+QUIET = os.getenv('FINLYT_QUIET','0') == '1'
+def _qprint(msg: str):
+    if not QUIET:
+        print(msg)
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional
 import requests
@@ -49,12 +53,12 @@ def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_p
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 raise RuntimeError(f"bicep build failed: {proc.stderr or proc.stdout}")
-            print(f"[bicep] Recompiled {src} -> {out_path}")
+            _qprint(f"[bicep] Recompiled {src} -> {out_path}")
             return out_path
         except Exception as ex:
             # Fallback to existing helper if direct build fails
             from finlyt_common import compile_bicep_to_json
-            print(f"[bicep] Direct build failed ({ex}); falling back to compile_bicep_to_json helper.")
+            _qprint(f"[bicep] Direct build failed ({ex}); falling back to compile_bicep_to_json helper.")
             return compile_bicep_to_json(src)
 
     template_json = _recompile_bicep(bicep_path)
@@ -111,7 +115,7 @@ def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_p
                     'deploymentTimestamp': {'value': datetime.now(UTC).isoformat()},
                     'tags': {'value': tags}
                 }
-                print("[fallback] Retrying deployment via SDK (ARM) due to CLI response consumption error.")
+                _qprint("[fallback] Retrying deployment via SDK (ARM) due to CLI response consumption error.")
                 poller = rm.deployments.begin_create_or_update(
                     rg_name,
                     f"finlythub-{hub_name}",
@@ -300,10 +304,10 @@ def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
         start = _parse_ym(start_month)
         end = _parse_ym(end_month)
     except ValueError as ex:
-        print(f" Historical seeding skipped: {ex}")
+        _qprint(f" Historical seeding skipped: {ex}")
         return
     if end < start:
-        print(" Historical seeding skipped: end before start.")
+        _qprint(" Historical seeding skipped: end before start.")
         return
 
     monthly_container = containers.get('monthly') or 'monthly'
@@ -318,7 +322,7 @@ def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
         return comp
     base_comp = _effective(fmt_choice, compression_choice)
 
-    print("\n[historical] Seeding months from", start.strftime('%Y-%m'), "to", end.strftime('%Y-%m'))
+    _qprint(f"\n[historical] Seeding months from {start.strftime('%Y-%m')} to {end.strftime('%Y-%m')}")
 
     # Overlap detection (blob-based) to prompt user
     try:
@@ -357,16 +361,16 @@ def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
     overlaps_exist = any(existing_by_ds[ds] for ds in datasets)
     action = 's'
     if overlaps_exist:
-        print("[historical] Existing data detected:")
+        _qprint("[historical] Existing data detected:")
         for ds in datasets:
             if existing_by_ds[ds]:
-                print(f"  {ds}: {', '.join(sorted(existing_by_ds[ds]))}")
+                _qprint(f"  {ds}: {', '.join(sorted(existing_by_ds[ds]))}")
         while True:
             action = input("Action for existing months? [S]kip / [O]verwrite / [C]ancel (default S): ").strip().lower() or 's'
             if action in ('s','o','c'):
                 break
         if action == 'c':
-            print("[historical] Cancelled.")
+            _qprint("[historical] Cancelled.")
             return
 
     hist_overwrite = (action == 'o')
@@ -398,11 +402,11 @@ def seed_historical_cost_datasets(cred, scope_id: str, datasets: list[str], *,
             try:
                 create_or_update_export(cred, scope_id, export_name, body)
                 run_export(cred, scope_id, export_name)
-                print(f"  {ds} {yyyymm}: submitted -> container={monthly_container} path={root_path}")
+                _qprint(f"  {ds} {yyyymm}: submitted -> container={monthly_container} path={root_path}")
             except Exception as ex:
-                print(f"  WARN {ds} {yyyymm}: {ex}")
+                _qprint(f"  WARN {ds} {yyyymm}: {ex}")
             time.sleep(1.0)  # light pacing to reduce throttling risk
-    print("[historical] Historical export runs queued. Files appear as runs complete.")
+    _qprint("[historical] Historical export runs queued. Files appear as runs complete.")
 
 
 # ---------- Settings helpers ----------

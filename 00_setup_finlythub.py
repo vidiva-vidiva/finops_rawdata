@@ -110,6 +110,11 @@ def maybe_bootstrap_venv(disable: bool = False):
 
 # ----------------------- Helpers -----------------------
 def _log(msg: str):
+    if os.getenv('FINLYT_QUIET','0') == '1':
+        # Still allow critical warnings/errors if prefixed specially
+        if msg.lower().startswith('error') or msg.lower().startswith('warn'):
+            print(f"[Finlyt] {msg}")
+        return
     print(f"[Finlyt] {msg}")
 
 
@@ -646,6 +651,8 @@ def _extract_sa_name(resource_id: Optional[str]) -> Optional[str]:
     return m.group(1) if m else None
 
 def _summarize_environment(analysis: Dict[str,Any]):
+    if os.getenv('FINLYT_QUIET','0') == '1':
+        return
     print("\n----- Finlyt Hub Detected -----")
     print(f"Scope: {analysis.get('recommended_scope_id') or '-'}")
     print(f"Subscription Id: {analysis.get('settings_subscription_id') or '-'}")
@@ -664,9 +671,10 @@ def root_menu(args):
     """Top-level menu (Install or Repair). Always uses interactive deploy for Install."""
     while True:
         if sys.stdout.isatty():
-            hdr = "Finlyt Setup"
-            line = '=' * len(hdr)
-            print(f"\n\033[36m{line}\n{hdr}\n{line}\033[0m")
+                if os.getenv('FINLYT_QUIET','0') != '1':
+                    hdr = "Finlyt Setup"
+                    line = '=' * len(hdr)
+                    print(f"\n\033[36m{line}\n{hdr}\n{line}\033[0m")
         choice = _menu("Finlyt Setup", [
             "Install Finlyt (interactive)",
             "Repair / Manage Finlyt",

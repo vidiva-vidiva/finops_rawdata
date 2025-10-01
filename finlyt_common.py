@@ -11,7 +11,7 @@ from typing import Optional, Any, Dict, Iterable
 UTC = timezone.utc
 RETRYABLE = {429, 500, 502, 503, 504}
 
-def run_cmd(cmd: Iterable[str], *, check: bool = True, capture: bool = False, env: dict | None = None):
+def run_cmd(cmd: Iterable[str], *, check: bool = True, capture: bool = False, env: dict | None = None, quiet: Optional[bool] = None):
     """
     Run a shell command with nice logging.
     - If capture=True: returns stdout (str) and prints it.
@@ -19,7 +19,10 @@ def run_cmd(cmd: Iterable[str], *, check: bool = True, capture: bool = False, en
     Raises CalledProcessError when check=True and the command fails.
     """
     cmd = list(cmd)
-    print(f"\n$ {' '.join(cmd)}")
+    if quiet is None:
+        quiet = os.getenv('FINLYT_QUIET','0') == '1'
+    if not quiet:
+        print(f"\n$ {' '.join(cmd)}")
     proc = subprocess.run(
         cmd,
         check=check,
@@ -29,7 +32,8 @@ def run_cmd(cmd: Iterable[str], *, check: bool = True, capture: bool = False, en
         env=env or os.environ.copy(),
     )
     if capture:
-        print(proc.stdout or "")
+        if not quiet:
+            print(proc.stdout or "")
         return proc.stdout
     return ""
 

@@ -12,6 +12,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 JUST_DETECT=0
 NO_ORCH=0
 FORCE_DETECT=0
+QUIET=0
 
 usage() {
   cat <<EOF
@@ -21,6 +22,7 @@ Options:
   --just-detect        Run detection only (01) then exit
   --no-orchestrator    Skip launching orchestrator after detection
   --force-detect       Re-run detection even if split settings already exist
+  --quiet              Suppress detailed output (only high-level Finlyt lines)
   -h, --help           Show this help
 
 Environment overrides:
@@ -33,24 +35,36 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --just-detect) JUST_DETECT=1; shift ;;
-    --no-orchestrator) NO_ORCH=1; shift ;;
-    --force-detect) FORCE_DETECT=1; shift ;;
+  --just-detect) JUST_DETECT=1; shift ;;
+  --no-orchestrator) NO_ORCH=1; shift ;;
+  --force-detect) FORCE_DETECT=1; shift ;;
+  --quiet) QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[Finlyt] Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
 
-info() { echo "[Finlyt] $*"; }
+info() { if [[ $QUIET -eq 0 ]]; then echo "[Finlyt] $*"; fi }
+quiet_run() {
+  if [[ $QUIET -eq 1 ]]; then
+    "$@" >/dev/null 2>&1 || return $?
+  else
+    "$@" || return $?
+  fi
+}
 
 if command -v git >/dev/null 2>&1; then
   if [[ -d "$TARGET_DIR/.git" ]]; then
     info "Updating existing repo in $TARGET_DIR";
-    git -C "$TARGET_DIR" fetch --quiet || true
-    git -C "$TARGET_DIR" pull --ff-only || true
+    quiet_run git -C "$TARGET_DIR" fetch --quiet || true
+    quiet_run git -C "$TARGET_DIR" pull --ff-only || true
   else
     info "Cloning repo into $TARGET_DIR";
-    git clone "$REPO_URL" "$TARGET_DIR";
+    if [[ $QUIET -eq 1 ]]; then
+      git clone --quiet "$REPO_URL" "$TARGET_DIR";
+    else
+      git clone "$REPO_URL" "$TARGET_DIR";
+    fi
   fi
 else
   info "git not found; attempting archive download (curl)";
@@ -75,11 +89,20 @@ fi
 # shellcheck source=/dev/null
 source .venv/bin/activate
 
+export FINLYT_QUIET=$QUIET
 info "Upgrading pip"
-pip install --upgrade pip >/dev/null
+if [[ $QUIET -eq 1 ]]; then
+  pip install --disable-pip-version-check --quiet --upgrade pip >/dev/null 2>&1 || true
+else
+  pip install --upgrade pip >/dev/null
+fi
 
 info "Installing dependencies"
-pip install -r requirements.txt
+if [[ $QUIET -eq 1 ]]; then
+  pip install --disable-pip-version-check --quiet -r requirements.txt >/dev/null 2>&1 || true
+else
+  pip install -r requirements.txt
+fi
 
 SET_FILES=(user_settings.json finlyt_settings.json cm_export_settings.json)
 MISSING=0
