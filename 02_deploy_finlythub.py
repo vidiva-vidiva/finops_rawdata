@@ -960,18 +960,29 @@ def interactive_flow(cred, settings):
         dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
         if not dest_sub:
             import re
-            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
+            # Try to derive from scope if it's a subscription or RG scope
+            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id or "", flags=re.IGNORECASE)
             if m_sub:
                 dest_sub = m_sub.group(1)
-            else:
-                dest_sub = None
-            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
+        if not dest_rg:
+            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id or "", flags=re.IGNORECASE)
             if m_rg:
                 dest_rg = m_rg.group(1)
-        if not dest_rg and dest_sub:
-            dest_rg = f"rg-finlythub-{dest_sub[:8]}"
+        # If still missing (billing scopes etc.), prompt user interactively
+        if (not dest_sub or not dest_rg) and sys.stdin.isatty():
+            print("\nNo existing Finlyt Hub subscription/RG context found for this scope.")
+            print("Provide a subscription + resource group to host (or reuse) the Finlyt Hub storage.")
+            while not dest_sub:
+                dest_sub = input(" Destination subscription id: ").strip() or None
+                if not dest_sub:
+                    print("  Subscription id required.")
+            if not dest_rg:
+                suggested_rg = f"rg-finlythub-{dest_sub[:8]}"
+                dest_rg = input(f" Destination resource group name [{suggested_rg}]: ").strip() or suggested_rg
         if not dest_sub or not dest_rg:
-            raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
+            raise RuntimeError('Unable to determine destination subscription/resource group for Finlyt Hub storage.')
+        if not dest_rg:
+            dest_rg = f"rg-finlythub-{dest_sub[:8]}"
         suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
         hub_name = f"finlythub{suffix}"
         mi_name  = f"{hub_name}-mi"
