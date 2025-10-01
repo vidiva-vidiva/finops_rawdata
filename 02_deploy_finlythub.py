@@ -1270,6 +1270,17 @@ def interactive_flow(cred, settings):
             try:
                 if simple_path_mode:
                     # Reuse existing monthly export definitions (or create if missing) and run with Custom timeframe per month.
+                    def _hist_eff_comp(fmt_str: str, comp_str: Optional[str], export_type: str):
+                        # Mirror earlier logic used in main export creation loop
+                        if export_type.startswith('Reservation'):
+                            return None  # force none for reservation exports (CSV output enforced)
+                        if not comp_str or comp_str.lower() == 'none':
+                            return None
+                        if fmt_str == 'Csv' and comp_str == 'Snappy':
+                            return 'Gzip'
+                        if fmt_str == 'Parquet' and comp_str == 'Gzip':
+                            return 'Snappy'
+                        return comp_str
                     for ds in elig:
                         export_type = dataset_api_type.get(ds, ds)
                         container_name = containers.get('monthly','monthly')
@@ -1303,7 +1314,7 @@ def interactive_flow(cred, settings):
                                 container=container_name, root=(sched_name if simple_path_mode else default_roots.get(ds,'')),
                                 fmt=('Csv' if export_type.startswith('Reservation') else fmt_choice),
                                 timeframe=original_timeframe,
-                                compression=None if export_type.startswith('Reservation') else (None if compression=='None' else compression),
+                                compression=_hist_eff_comp(('Csv' if export_type.startswith('Reservation') else fmt_choice), compression, export_type),
                                 overwrite=False,
                                 schedule_status='Active'
                             )
@@ -1395,7 +1406,7 @@ def interactive_flow(cred, settings):
                                 container=container_name, root=(sched_name if simple_path_mode else default_roots.get(ds,'')),
                                 fmt=('Csv' if export_type.startswith('Reservation') else fmt_choice),
                                 timeframe=original_timeframe,
-                                compression=None if export_type.startswith('Reservation') else (None if compression=='None' else compression),
+                                compression=_hist_eff_comp(('Csv' if export_type.startswith('Reservation') else fmt_choice), compression, export_type),
                                 overwrite=False,
                                 schedule_status='Active'
                             )
