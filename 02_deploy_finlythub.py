@@ -960,29 +960,18 @@ def interactive_flow(cred, settings):
         dest_loc = (finlyt.get('subscription', {}) or {}).get('location') or 'eastus'
         if not dest_sub:
             import re
-            # Try to derive from scope if it's a subscription or RG scope
-            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id or "", flags=re.IGNORECASE)
+            m_sub = re.search(r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE)
             if m_sub:
                 dest_sub = m_sub.group(1)
-        if not dest_rg:
-            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id or "", flags=re.IGNORECASE)
+            else:
+                dest_sub = None
+            m_rg = re.search(r"/resourcegroups/([^/]+)", scope_id, flags=re.IGNORECASE)
             if m_rg:
                 dest_rg = m_rg.group(1)
-        # If still missing (billing scopes etc.), prompt user interactively
-        if (not dest_sub or not dest_rg) and sys.stdin.isatty():
-            print("\nNo existing Finlyt Hub subscription/RG context found for this scope.")
-            print("Provide a subscription + resource group to host (or reuse) the Finlyt Hub storage.")
-            while not dest_sub:
-                dest_sub = input(" Destination subscription id: ").strip() or None
-                if not dest_sub:
-                    print("  Subscription id required.")
-            if not dest_rg:
-                suggested_rg = f"rg-finlythub-{dest_sub[:8]}"
-                dest_rg = input(f" Destination resource group name [{suggested_rg}]: ").strip() or suggested_rg
-        if not dest_sub or not dest_rg:
-            raise RuntimeError('Unable to determine destination subscription/resource group for Finlyt Hub storage.')
-        if not dest_rg:
+        if not dest_rg and dest_sub:
             dest_rg = f"rg-finlythub-{dest_sub[:8]}"
+        if not dest_sub or not dest_rg:
+            raise RuntimeError('settings.finlyt.subscription.id and resource_group.name are required (or inferable).')
         suffix   = hashlib.sha1(dest_sub.encode()).hexdigest()[:8]
         hub_name = f"finlythub{suffix}"
         mi_name  = f"{hub_name}-mi"
@@ -1111,9 +1100,6 @@ def interactive_flow(cred, settings):
     if override_meta and override_meta.get('pending') == 'bicep':
         plan = override_meta
         try:
-            clean_tags = {k: v for k, v in (plan.get('tags') or {}).items() if k.lower() != 'mode'}
-            if 'Application' not in clean_tags:
-                clean_tags['Application'] = 'FinlytHub'
             deployed = deploy_finlythub_via_bicep(
                 cred=cred,
                 subscription_id=plan['subscription_id'],
@@ -1122,7 +1108,7 @@ def interactive_flow(cred, settings):
                 hub_name=plan['hub_name'],
                 mi_name=plan['mi_name'],
                 location=plan['location'],
-                tags=clean_tags
+                tags=plan.get('tags', {"Application":"FinlytHub","Mode":"Override"})
             )
             override_meta.update(deployed)
         except Exception as ex:
@@ -1131,10 +1117,7 @@ def interactive_flow(cred, settings):
     elif override_meta and override_meta.get('pending') == 'sdk':
         plan = override_meta
         try:
-            base_tags = {k:v for k,v in (plan.get('tags') or {}).items() if k.lower() != 'mode'}
-            if 'Application' not in base_tags:
-                base_tags['Application'] = 'FinlytHub'
-            ensure_rg(cred, plan['subscription_id'], plan['resource_group'], plan['location'], tags=base_tags or {"Application":"FinlytHub"})
+            ensure_rg(cred, plan['subscription_id'], plan['resource_group'], plan['location'], tags=plan.get('tags') or {"Application":"FinlytHub","Mode":"Override"})
             ensure_sa(cred, plan['subscription_id'], plan['resource_group'], plan['storage_account_name'], plan['location'])
             for c in ['daily','monthly','reservation']:
                 try:
