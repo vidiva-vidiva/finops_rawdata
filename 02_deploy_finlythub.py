@@ -20,6 +20,8 @@ Docs: https://learn.microsoft.com/rest/api/cost-management/exports/create-or-upd
 
 # ---------- Imports ----------
 import os, sys, json, time, re, hashlib, subprocess
+# API versions (centralized)
+EXPORTS_API = "2025-03-01"  # Cost Management Exports API version aligned with detection script
 QUIET = os.getenv('FINLYT_QUIET','0') == '1'
 def _qprint(msg: str):
     if not QUIET:
@@ -27,6 +29,7 @@ def _qprint(msg: str):
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Any, Optional
 import requests
+UTC = timezone.utc
 
 from finlyt_common import run_cmd, compile_bicep_to_json, http_with_backoff, get_token
 from settings_io import load_aggregated as load_split_settings, update_exports
@@ -171,7 +174,6 @@ def deploy_finlythub_via_bicep(cred, subscription_id: str, rg_name: str, bicep_p
 
 # ---------- Exports ----------
 def create_or_update_export(cred, scope_id: str, export_name: str, export_body: Dict[str, Any]) -> Dict[str, Any]:
-    from finlyt_common import get_token
     token = get_token(cred)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     url = (f"https://management.azure.com/{scope_id}"
