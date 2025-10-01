@@ -577,7 +577,7 @@ def interactive_add_exports(python_exe: str, settings_path: str):
     except Exception:
         # Fallback to original path (may be legacy or missing). Deploy script will attempt its own aggregation.
         use_settings_path = settings_path
-    cmd = [python_exe, '02_deploy_finlythub.py', '--interactive', '--settings', use_settings_path]
+    cmd = [python_exe, '02_deploy_finlythub.py']
     _log('Launching export creation (interactive)...')
     # Preflight dependency check so we can give a friendly message BEFORE entering wizard
     missing = []
@@ -690,7 +690,7 @@ def root_menu(args):
         }
         _summarize_environment(analysis)
         if choice == 0:  # Always interactive deploy
-            cmd = [sys.executable, '02_deploy_finlythub.py', '--interactive', '--settings', SETTINGS_FILE]
+            cmd = [sys.executable, '02_deploy_finlythub.py']
             _log('Launching interactive deploy: ' + ' '.join(cmd))
             rc = subprocess.call(cmd)
             if rc != 0:
