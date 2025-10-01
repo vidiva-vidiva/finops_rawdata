@@ -18,6 +18,7 @@ from azure.identity import DefaultAzureCredential
 from finlyt_common import get_token, http_with_backoff
 
 QUIET = os.getenv('FINLYT_QUIET','0') == '1'
+FORCE_TABLES = os.getenv('FINLYT_CLEANUP_FORCE_TABLE','0') == '1'
 def _log(msg: str):
     if QUIET:
         # show only errors/warnings
@@ -111,8 +112,13 @@ def _print_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str]], tit
          (excluding first two) down to a floor (min 8 chars) until it fits.
       3. Truncate cell values to final column widths.
     """
-    if QUIET:
-        return  # suppress tables entirely in quiet mode
+    if QUIET and not FORCE_TABLES:
+        # Suppress full table but emit a short summary so prompts still make sense.
+        if rows:
+            print(f"\n{title}: {len(rows)} item(s) (quiet mode: set FINLYT_CLEANUP_FORCE_TABLE=1 or FINLYT_QUIET=0 to see details)")
+        else:
+            print(f"\n{title}: (none found)")
+        return
     if not rows:
         print(f"\n{title}: (none found)")
         return
